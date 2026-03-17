@@ -1487,6 +1487,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const peerLayerRef = useRef(null);
   const routeLayerRef = useRef(null);
   const routeAbortRef = useRef(null);
+  const lastRouteKeyRef = useRef(null);
   const tileLayerRef = useRef(null);
   const [showAddBlip, setShowAddBlip] = useState(false);
   const [selectedBlip, setSelectedBlip] = useState(null);
@@ -1496,6 +1497,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const [routeTarget, setRouteTarget] = useState(null);
   const [routeData, setRouteData] = useState(null);
   const [routeLoading, setRouteLoading] = useState(false);
+  const [routeActive, setRouteActive] = useState(false);
   const [awaitingMapPick, setAwaitingMapPick] = useState(false);
   const allCategories = categories && categories.length ? categories : BLIP_CATEGORIES;
 
@@ -1602,8 +1604,18 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     if (!routeTarget || !position) {
       setRouteData(null);
       setRouteLoading(false);
+      lastRouteKeyRef.current = null;
       return;
     }
+
+    const targetKey = routeTarget.lat.toFixed(5) + ',' + routeTarget.lng.toFixed(5);
+    const posKey = position.lat.toFixed(5) + ',' + position.lng.toFixed(5);
+    const routeKey = routeActive ? targetKey + '|' + posKey : targetKey;
+    if (routeData && lastRouteKeyRef.current === routeKey) {
+      return;
+    }
+    lastRouteKeyRef.current = routeKey;
+
     if (routeAbortRef.current) {
       try { routeAbortRef.current.abort(); } catch {}
     }
@@ -1628,7 +1640,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         showToast('Routing unavailable', 'var(--amber)');
       })
       .finally(() => setRouteLoading(false));
-  }, [routeTarget, position]);
+  }, [routeTarget, position, routeActive, routeData]);
 
   // Update blips on map
   useEffect(() => {
@@ -1873,11 +1885,18 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         e('div', { style: { fontSize: 13, color: 'var(--text-primary)', fontWeight: 600 } }, 'Shortest: ' + distanceStr(routeDistances.direct)),
         e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, 'Alternative: ' + (routeDistances.alt !== null ? distanceStr(routeDistances.alt) : '--')),
       ),
-      e('button', {
-        onClick: () => setRouteTarget(null),
-        className: 'boost-btn',
-        style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer' }
-      }, 'Clear'),
+      e('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+        e('button', {
+          onClick: () => setRouteActive(!routeActive),
+          className: 'boost-btn',
+          style: { background: routeActive ? 'var(--neon-green)' : 'var(--bg-card2)', border: '1px solid ' + (routeActive ? 'var(--neon-green)' : 'var(--border)'), borderRadius: 8, padding: '6px 10px', color: routeActive ? 'var(--bg-deep)' : 'var(--text-secondary)', fontSize: 11, cursor: 'pointer', fontWeight: 600 }
+        }, routeActive ? 'Stop' : 'Start'),
+        e('button', {
+          onClick: () => { setRouteTarget(null); setRouteActive(false); },
+          className: 'boost-btn',
+          style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer' }
+        }, 'Clear'),
+      ),
     ),
 
     // FAB - positioned above bottom nav
@@ -2480,6 +2499,14 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(e(App));
+
+
+
+
+
+
+
+
 
 
 
