@@ -296,6 +296,7 @@ function QRCodeDisplay({ text, size = 180 }) {
 function QRScannerModal({ onScan, onClose }) {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
+  const scannerRef = useRef(null);
   const [scanning, setScanning] = useState(true);
   const [manualInput, setManualInput] = useState('');
 
@@ -313,6 +314,24 @@ function QRScannerModal({ onScan, onClose }) {
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
       }
+      // Init QR scanner if available
+      if (window.QrScanner && videoRef.current) {
+        const scanner = new window.QrScanner(
+          videoRef.current,
+          (result) => {
+            const id = (result && result.data) ? result.data : (typeof result === 'string' ? result : '');
+            if (id) {
+              stopCamera();
+              onScan(id);
+            }
+          },
+          { returnDetailedScanResult: true, maxScansPerSecond: 4 }
+        );
+        scannerRef.current = scanner;
+        scanner.start().catch(() => {});
+      } else {
+        setScanning(false);
+      }
     } catch (err) {
       console.warn('Camera access denied:', err);
       setScanning(false);
@@ -320,6 +339,11 @@ function QRScannerModal({ onScan, onClose }) {
   }
 
   function stopCamera() {
+    if (scannerRef.current) {
+      try { scannerRef.current.stop(); } catch {}
+      try { scannerRef.current.destroy(); } catch {}
+      scannerRef.current = null;
+    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(t => t.stop());
       streamRef.current = null;
