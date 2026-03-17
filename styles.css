@@ -17,6 +17,10 @@
   --glass: rgba(12, 18, 34, 0.72);
   --glass-strong: rgba(12, 18, 34, 0.88);
   --bottom-nav-height: 48px;
+  --chat-sent-bg: linear-gradient(135deg, #45d7ff, #23b6ff);
+  --chat-sent-text: #0b0f1a;
+  --chat-recv-bg: #202945;
+  --chat-recv-text: var(--text-primary);
 }
 
 * {
@@ -87,6 +91,10 @@ body.theme-ivory {
   --border-soft: #ece6da;
   --glass: rgba(255, 255, 255, 0.8);
   --glass-strong: rgba(255, 255, 255, 0.92);
+  --chat-sent-bg: var(--accent);
+  --chat-sent-text: #ffffff;
+  --chat-recv-bg: var(--bg-card2);
+  --chat-recv-text: var(--text-primary);
 }
 
 body.theme-carbon {
@@ -137,6 +145,10 @@ body.theme-sand {
   --border-soft: #efe6d8;
   --glass: rgba(255, 255, 255, 0.82);
   --glass-strong: rgba(255, 255, 255, 0.94);
+  --chat-sent-bg: var(--accent);
+  --chat-sent-text: #ffffff;
+  --chat-recv-bg: var(--bg-card2);
+  --chat-recv-text: var(--text-primary);
 }
 
 body::before {
@@ -338,15 +350,15 @@ input, textarea, select {
 }
 
 .message-sent {
-  background: linear-gradient(135deg, #45d7ff, #23b6ff);
-  color: #0b0f1a;
+  background: var(--chat-sent-bg);
+  color: var(--chat-sent-text);
   border-bottom-right-radius: 4px;
   margin-left: auto;
 }
 
 .message-received {
-  background: #202945;
-  color: var(--text-primary);
+  background: var(--chat-recv-bg);
+  color: var(--chat-recv-text);
   border-bottom-left-radius: 4px;
 }
 
@@ -401,4 +413,9 @@ input:focus, textarea:focus, select:focus {
 @keyframes fade-out {
   to { opacity: 0; pointer-events: none; }
 }
+
+
+
+
+
 

@@ -1432,7 +1432,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
 
   return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column' } },
     // Chat header
-    e('div', { style: { display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderBottom: '1px solid var(--border)', background: 'rgba(26,26,46,0.8)', flexShrink: 0 } },
+    e('div', { style: { display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderBottom: '1px solid var(--border)', background: 'var(--glass-strong)', flexShrink: 0 } },
       e('button', {
         onClick: () => setActiveChatPeer(null),
         style: { background: 'none', border: 'none', color: 'var(--accent)', fontSize: 20, cursor: 'pointer', padding: 4 }
@@ -1461,7 +1461,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
       e('div', { ref: messagesEndRef }),
     ),
     // Input
-    e('div', { style: { padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', gap: 8, background: 'rgba(10,10,20,0.8)', flexShrink: 0 } },
+    e('div', { style: { padding: '10px 16px', borderTop: '1px solid var(--border)', display: 'flex', gap: 8, background: 'var(--glass)', flexShrink: 0 } },
       e('input', {
         value: chatInput, onChange: (ev) => setChatInput(ev.target.value),
         onKeyDown: (ev) => ev.key === 'Enter' && handleSend(),
@@ -1486,6 +1486,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const blipLayerRef = useRef(null);
   const peerLayerRef = useRef(null);
   const routeLayerRef = useRef(null);
+  const routeAbortRef = useRef(null);
   const tileLayerRef = useRef(null);
   const [showAddBlip, setShowAddBlip] = useState(false);
   const [selectedBlip, setSelectedBlip] = useState(null);
@@ -1493,6 +1494,8 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const [newBlip, setNewBlip] = useState({ type: 'cool_spot', title: '', desc: '', expiry: 86400000, shareWithPeers: true, dropAtLocation: true });
   const [showWaypoint, setShowWaypoint] = useState(false);
   const [routeTarget, setRouteTarget] = useState(null);
+  const [routeData, setRouteData] = useState(null);
+  const [routeLoading, setRouteLoading] = useState(false);
   const [awaitingMapPick, setAwaitingMapPick] = useState(false);
   const allCategories = categories && categories.length ? categories : BLIP_CATEGORIES;
 
@@ -1595,6 +1598,38 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     return () => map.off('click', handlePick);
   }, [awaitingMapPick]);
 
+  useEffect(() => {
+    if (!routeTarget || !position) {
+      setRouteData(null);
+      setRouteLoading(false);
+      return;
+    }
+    if (routeAbortRef.current) {
+      try { routeAbortRef.current.abort(); } catch {}
+    }
+    const controller = new AbortController();
+    routeAbortRef.current = controller;
+    const start = position.lng + ',' + position.lat;
+    const end = routeTarget.lng + ',' + routeTarget.lat;
+    const url = 'https://router.project-osrm.org/route/v1/driving/' + start + ';' + end + '?overview=full&geometries=geojson&alternatives=true&steps=false';
+    setRouteLoading(true);
+    fetch(url, { signal: controller.signal })
+      .then(res => res.json())
+      .then(data => {
+        if (data && data.routes && data.routes.length) {
+          setRouteData(data);
+        } else {
+          setRouteData(null);
+        }
+      })
+      .catch(err => {
+        if (err && err.name === 'AbortError') return;
+        setRouteData(null);
+        showToast('Routing unavailable', 'var(--amber)');
+      })
+      .finally(() => setRouteLoading(false));
+  }, [routeTarget, position]);
+
   // Update blips on map
   useEffect(() => {
     if (!blipLayerRef.current) return;
@@ -1658,15 +1693,30 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     if (!routeLayerRef.current) return;
     routeLayerRef.current.clearLayers();
     if (!routeTarget || !position) return;
-    const start = [position.lat, position.lng];
     const end = [routeTarget.lat, routeTarget.lng];
-    const directLine = L.polyline([start, end], { color: 'var(--accent)', weight: 4, opacity: 0.9 });
-    const altLine = L.polyline(buildAltRoute(position, routeTarget), { color: 'var(--magenta)', weight: 3, opacity: 0.7, dashArray: '6 8' });
+
+    if (routeData && routeData.routes && routeData.routes.length) {
+      const r0 = routeData.routes[0];
+      const coords0 = (r0.geometry && r0.geometry.coordinates || []).map(c => [c[1], c[0]]);
+      if (coords0.length) {
+        routeLayerRef.current.addLayer(L.polyline(coords0, { color: 'var(--accent)', weight: 4, opacity: 0.9 }));
+      }
+      const r1 = routeData.routes[1];
+      if (r1 && r1.geometry && r1.geometry.coordinates && r1.geometry.coordinates.length) {
+        const coords1 = r1.geometry.coordinates.map(c => [c[1], c[0]]);
+        routeLayerRef.current.addLayer(L.polyline(coords1, { color: 'var(--magenta)', weight: 3, opacity: 0.7, dashArray: '6 8' }));
+      }
+    } else {
+      const start = [position.lat, position.lng];
+      const directLine = L.polyline([start, end], { color: 'var(--accent)', weight: 4, opacity: 0.9 });
+      const altLine = L.polyline(buildAltRoute(position, routeTarget), { color: 'var(--magenta)', weight: 3, opacity: 0.7, dashArray: '6 8' });
+      routeLayerRef.current.addLayer(directLine);
+      routeLayerRef.current.addLayer(altLine);
+    }
+
     const targetMarker = L.circleMarker(end, { radius: 6, color: 'var(--amber)', weight: 2, fillColor: 'var(--amber)', fillOpacity: 0.8 });
-    routeLayerRef.current.addLayer(directLine);
-    routeLayerRef.current.addLayer(altLine);
     routeLayerRef.current.addLayer(targetMarker);
-  }, [routeTarget, position]);
+  }, [routeTarget, position, routeData]);
 
 
   function handleAddBlip() {
@@ -1716,11 +1766,16 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
 
   const routeDistances = useMemo(() => {
     if (!routeTarget || !position) return null;
+    if (routeData && routeData.routes && routeData.routes.length) {
+      const direct = routeData.routes[0].distance || 0;
+      const alt = routeData.routes[1] ? routeData.routes[1].distance || 0 : null;
+      return { direct, alt };
+    }
     const direct = haversine(position.lat, position.lng, routeTarget.lat, routeTarget.lng);
     const altPath = buildAltRoute(position, routeTarget);
     const alt = haversine(altPath[0][0], altPath[0][1], altPath[1][0], altPath[1][1]) + haversine(altPath[1][0], altPath[1][1], altPath[2][0], altPath[2][1]);
     return { direct, alt };
-  }, [routeTarget, position]);
+  }, [routeTarget, position, routeData]);
 
   return e('div', { style: { height: '100%', position: 'relative' } },
     e('div', { ref: mapContainerRef, style: { width: '100%', height: '100%' } }),
@@ -1813,9 +1868,10 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       }
     },
       e('div', null,
-        e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginBottom: 2 } }, 'Route to ' + (routeTarget.label || 'Waypoint')) ,
+        e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginBottom: 2 } }, 'Route to ' + (routeTarget.label || 'Waypoint')),
+        routeLoading && e('div', { style: { fontSize: 10, color: 'var(--text-secondary)', marginBottom: 4 } }, 'Calculating route...'),
         e('div', { style: { fontSize: 13, color: 'var(--text-primary)', fontWeight: 600 } }, 'Shortest: ' + distanceStr(routeDistances.direct)),
-        e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, 'Alternative: ' + distanceStr(routeDistances.alt)),
+        e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, 'Alternative: ' + (routeDistances.alt !== null ? distanceStr(routeDistances.alt) : '--')),
       ),
       e('button', {
         onClick: () => setRouteTarget(null),
@@ -2424,6 +2480,18 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(e(App));
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
