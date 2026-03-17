@@ -1,7 +1,11 @@
-﻿const { useState, useEffect, useRef, useCallback, useMemo } = React;
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
 const e = React.createElement;
 
 // ========================== UTILS ==========================
+
+const OUTBOX_RETRY_MS = 5000;
+const PING_INTERVAL_MS = 7000;
+const PONG_TIMEOUT_MS = 18000;
 
 function generateId(prefix = '') {
   return prefix + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
@@ -650,9 +654,12 @@ function App() {
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [activeChatPeer, setActiveChatPeer] = useState(null);
   const [unreadCounts, setUnreadCounts] = useState({});
+  const [outbox, setOutbox] = useState(() => loadStorage('boost_outbox', []));
+  const [networkOnline, setNetworkOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
 
   const peerRef = useRef(null);
   const connectionsRef = useRef({});
+  const peerHealthRef = useRef({});
   const mapRef = useRef(null);
   const markersRef = useRef({});
 
@@ -671,6 +678,32 @@ function App() {
   useEffect(() => { saveStorage('boost_messages', messages); }, [messages]);
   useEffect(() => { saveStorage('boost_blips', blips); }, [blips]);
   useEffect(() => { saveStorage('boost_geochat', geochatMessages); }, [geochatMessages]);
+  useEffect(() => { saveStorage('boost_outbox', outbox); }, [outbox]);
+
+  useEffect(() => {
+    function handleOnline() {
+      setNetworkOnline(true);
+      if (peerRef.current && peerRef.current.disconnected) {
+        try { peerRef.current.reconnect(); } catch {}
+      }
+      if (peerRef.current && peerRef.current.open) {
+        setConnectionStatus('connected');
+      } else {
+        setConnectionStatus('connecting');
+      }
+      flushOutbox();
+    }
+    function handleOffline() {
+      setNetworkOnline(false);
+      setConnectionStatus('disconnected');
+    }
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
 
   // Geolocation
   useEffect(() => {
@@ -749,6 +782,7 @@ function App() {
   function handleConnection(conn) {
     const peerId = conn.peer;
     connectionsRef.current[peerId] = conn;
+    peerHealthRef.current[peerId] = { lastPong: Date.now() };
 
     conn.on('open', () => {
       setPeers(prev => {
@@ -764,6 +798,7 @@ function App() {
       myBlips.forEach(b => {
         conn.send({ type: 'blip', blip: b });
       });
+      flushOutbox(peerId);
     });
 
     conn.on('data', (data) => {
@@ -772,11 +807,13 @@ function App() {
 
     conn.on('close', () => {
       delete connectionsRef.current[peerId];
+      delete peerHealthRef.current[peerId];
       setPeers(prev => prev.map(p => p.peerId === peerId ? { ...p, connected: false } : p));
     });
 
     conn.on('error', () => {
       delete connectionsRef.current[peerId];
+      delete peerHealthRef.current[peerId];
     });
   }
 
@@ -794,6 +831,10 @@ function App() {
 
   function handlePeerData(fromPeer, data) {
     if (!data || !data.type) return;
+    touchPeer(fromPeer);
+    if (data.deliveryId && data.type !== 'ack') {
+      try { connectionsRef.current[fromPeer] && connectionsRef.current[fromPeer].send({ type: 'ack', deliveryId: data.deliveryId }); } catch {}
+    }
 
     switch (data.type) {
       case 'intro':
@@ -866,7 +907,70 @@ function App() {
           connectionsRef.current[fromPeer].send({ type: 'pong' });
         }
         break;
+      case 'pong':
+        peerHealthRef.current[fromPeer] = { lastPong: Date.now() };
+        setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, connected: true, lastSeen: Date.now() } : p));
+        break;
+      case 'ack':
+        if (data.deliveryId) {
+          setOutbox(prev => prev.filter(item => !(item.id === data.deliveryId && item.peerId === fromPeer)));
+          setMessages(prev => {
+            const conv = prev[fromPeer] || [];
+            let changed = false;
+            const nextConv = conv.map(m => {
+              if (m.deliveryId === data.deliveryId) {
+                changed = true;
+                return { ...m, delivered: true };
+              }
+              return m;
+            });
+            return changed ? { ...prev, [fromPeer]: nextConv } : prev;
+          });
+        }
+        break;
     }
+  }
+
+  function touchPeer(peerId) {
+    setPeers(prev => {
+      const existing = prev.find(p => p.peerId === peerId);
+      if (existing) {
+        return prev.map(p => p.peerId === peerId ? { ...p, lastSeen: Date.now(), connected: true } : p);
+      }
+      return [...prev, { peerId, displayName: peerId, lastSeen: Date.now(), connected: true }];
+    });
+  }
+
+  const flushOutbox = useCallback((targetPeerId) => {
+    if (!navigator.onLine) return;
+    setOutbox(prev => {
+      const now = Date.now();
+      let changed = false;
+      const next = prev.map(item => {
+        if (targetPeerId && item.peerId !== targetPeerId) return item;
+        if (now - (item.lastAttempt || 0) < OUTBOX_RETRY_MS) return item;
+        const conn = connectionsRef.current[item.peerId];
+        if (!conn || !conn.open) return item;
+        try { conn.send(item.payload); } catch { return item; }
+        changed = true;
+        return { ...item, attempts: (item.attempts || 0) + 1, lastAttempt: now };
+      });
+      return changed ? next : prev;
+    });
+  }, []);
+
+  function queueOutbox(peerId, payload) {
+    const id = payload.deliveryId || generateId('out');
+    const entry = {
+      id,
+      peerId,
+      payload: { ...payload, deliveryId: id },
+      createdAt: Date.now(),
+      attempts: 0,
+      lastAttempt: 0,
+    };
+    setOutbox(prev => prev.some(item => item.id === id) ? prev : [...prev, entry]);
+    return id;
   }
 
   function sendToAllPeers(data) {
@@ -876,10 +980,43 @@ function App() {
   }
 
   function sendToPeer(peerId, data) {
-    if (connectionsRef.current[peerId]) {
-      try { connectionsRef.current[peerId].send(data); } catch {}
+    const conn = connectionsRef.current[peerId];
+    if (conn && conn.open) {
+      try { conn.send(data); } catch {}
     }
   }
+
+  function sendReliableToPeer(peerId, data) {
+    const deliveryId = queueOutbox(peerId, data);
+    const conn = connectionsRef.current[peerId];
+    if (!conn || !conn.open) {
+      connectToPeer(peerId);
+      return deliveryId;
+    }
+    if (navigator.onLine) {
+      try { conn.send({ ...data, deliveryId }); } catch {}
+    }
+    return deliveryId;
+  }
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      Object.entries(connectionsRef.current).forEach(([peerId, conn]) => {
+        if (conn && conn.open) {
+          try { conn.send({ type: 'ping', ts: Date.now() }); } catch {}
+        }
+      });
+      setPeers(prev => prev.map(p => {
+        const lastPong = (peerHealthRef.current[p.peerId] && peerHealthRef.current[p.peerId].lastPong) || p.lastSeen || 0;
+        if (Date.now() - lastPong > PONG_TIMEOUT_MS) {
+          return { ...p, connected: false };
+        }
+        return p;
+      }));
+      flushOutbox();
+    }, PING_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [flushOutbox]);
 
   // Blip expiry check
   useEffect(() => {
@@ -894,10 +1031,10 @@ function App() {
   // Layout
   return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column', background: 'var(--bg-deep)' } },
     // Header
-    e(Header, { profile, connectionStatus, connectedPeersCount }),
+    e(Header, { profile, connectionStatus, connectedPeersCount, onReconnect: initPeer }),
     // Main content area
     e('div', { style: { flex: 1, overflow: 'hidden', position: 'relative' } },
-      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
+      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
       activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, settings, peers, categories: allCategories }),
       activeTab === 'geochat' && e(GeochatView, { position, geochatMessages, setGeochatMessages, profile, sendToAllPeers, settings }),
       activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, setMessages, setGeochatMessages, setPeers, categories: allCategories }),
@@ -909,7 +1046,7 @@ function App() {
 
 // ========================== HEADER ==========================
 
-function Header({ profile, connectionStatus, connectedPeersCount }) {
+function Header({ profile, connectionStatus, connectedPeersCount, onReconnect }) {
   const statusColor = connectionStatus === 'connected' ? 'var(--neon-green)' : connectionStatus === 'connecting' ? 'var(--amber)' : 'var(--magenta)';
 
   return e('div', {
@@ -921,12 +1058,14 @@ function Header({ profile, connectionStatus, connectedPeersCount }) {
   },
     e('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
       e('div', {
+        onClick: () => { if (onReconnect) { onReconnect(); showToast('Reconnecting...', 'var(--amber)'); } },
         style: {
           fontSize: 20,
           color: 'var(--accent)',
           textShadow: '0 0 10px color-mix(in srgb, var(--accent) 70%, transparent), 0 0 24px color-mix(in srgb, var(--accent) 40%, transparent)',
           animation: 'bolt-pulse 2.2s ease-in-out infinite',
           transformOrigin: 'center',
+          cursor: 'pointer',
         }
       }, '⚡'),
       e('div', { style: { display: 'flex', flexDirection: 'column', lineHeight: 1 } },
@@ -992,7 +1131,7 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
 
 // ========================== CHAT VIEW ==========================
 
-function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, unreadCounts, setUnreadCounts, blips, categories }) {
+function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, unreadCounts, setUnreadCounts, blips, categories }) {
   const [connectInput, setConnectInput] = useState('');
   const [showConnect, setShowConnect] = useState(false);
   const [showQR, setShowQR] = useState(false);
@@ -1024,9 +1163,10 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
   function handleSend() {
     const text = chatInput.trim();
     if (!text || !activeChatPeer) return;
-    const msg = { id: generateId('msg'), text, sender: profile.peerId, timestamp: Date.now() };
+    const deliveryId = generateId('out');
+    const msg = { id: generateId('msg'), text, sender: profile.peerId, timestamp: Date.now(), deliveryId, delivered: false };
     setMessages(prev => ({ ...prev, [activeChatPeer]: [...(prev[activeChatPeer] || []), msg] }));
-    sendToPeer(activeChatPeer, { type: 'chat', message: text, timestamp: msg.timestamp });
+    sendReliableToPeer(activeChatPeer, { type: 'chat', message: text, timestamp: msg.timestamp, deliveryId });
     setChatInput('');
   }
 
@@ -2036,6 +2176,27 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(e(App));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

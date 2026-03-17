@@ -1,4 +1,4 @@
-﻿:root {
+:root {
   --bg-deep: #0b0f1a;
   --bg-surface: #0f1424;
   --bg-card: #141b2f;
@@ -243,6 +243,11 @@ input, textarea, select {
 
 .user-marker {
   position: relative;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .user-marker-dot {
@@ -396,3 +401,4 @@ input:focus, textarea:focus, select:focus {
 @keyframes fade-out {
   to { opacity: 0; pointer-events: none; }
 }
+
