@@ -59,6 +59,17 @@ function slugify(value) {
     .replace(/^_+|_+$/g, '');
 }
 
+
+function colorFromId(id) {
+  let hash = 0;
+  const str = String(id || '');
+  for (let i = 0; i < str.length; i++) {
+    hash = (hash << 5) - hash + str.charCodeAt(i);
+    hash |= 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  return 'hsl(' + hue + ', 70%, 55%)';
+}
 function loadStorage(key, def) {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : def; } catch { return def; }
 }
@@ -660,6 +671,8 @@ function App() {
   const peerRef = useRef(null);
   const connectionsRef = useRef({});
   const peerHealthRef = useRef({});
+  const peersRef = useRef([]);
+  const lastLocSentRef = useRef(0);
   const mapRef = useRef(null);
   const markersRef = useRef({});
 
@@ -675,6 +688,7 @@ function App() {
 
   const allCategories = useMemo(() => getAllCategories(settings.customBlipTypes), [settings.customBlipTypes]);
   useEffect(() => { saveStorage('boost_peers', peers); }, [peers]);
+  useEffect(() => { peersRef.current = peers; }, [peers]);
   useEffect(() => { saveStorage('boost_messages', messages); }, [messages]);
   useEffect(() => { saveStorage('boost_blips', blips); }, [blips]);
   useEffect(() => { saveStorage('boost_geochat', geochatMessages); }, [geochatMessages]);
@@ -779,6 +793,16 @@ function App() {
     });
   }
 
+  function updatePeer(peerId, patch) {
+    setPeers(prev => {
+      const existing = prev.find(p => p.peerId === peerId);
+      if (existing) {
+        return prev.map(p => p.peerId === peerId ? { ...p, ...patch } : p);
+      }
+      return [...prev, { peerId, displayName: peerId, lastSeen: Date.now(), connected: false, ...patch }];
+    });
+  }
+
   function handleConnection(conn) {
     const peerId = conn.peer;
     connectionsRef.current[peerId] = conn;
@@ -839,6 +863,38 @@ function App() {
     switch (data.type) {
       case 'intro':
         setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, displayName: data.displayName || fromPeer, avatar: data.avatar } : p));
+        break;
+      case 'loc_share_req':
+        updatePeer(fromPeer, { shareIn: true, lastSeen: Date.now() });
+        {
+          const peer = peersRef.current.find(p => p.peerId === fromPeer);
+          if (peer && peer.shareOut) {
+            sendToPeer(fromPeer, { type: 'loc_share_ack' });
+            updatePeer(fromPeer, { shareActive: true, shareIn: true });
+          }
+        }
+        break;
+      case 'loc_share_ack':
+        {
+          const peer = peersRef.current.find(p => p.peerId === fromPeer);
+          if (peer && peer.shareOut) {
+            updatePeer(fromPeer, { shareActive: true, shareIn: true });
+          } else {
+            updatePeer(fromPeer, { shareIn: true });
+          }
+        }
+        break;
+      case 'loc_stop':
+        updatePeer(fromPeer, { shareActive: false, shareIn: false });
+        break;
+      case 'loc_update':
+        if (typeof data.lat === 'number' && typeof data.lng === 'number') {
+          updatePeer(fromPeer, {
+            lastLoc: { lat: data.lat, lng: data.lng, accuracy: data.accuracy || null },
+            lastLocAt: data.ts || Date.now(),
+            shareIn: true,
+          });
+        }
         break;
       case 'chat':
         setMessages(prev => {
@@ -932,13 +988,7 @@ function App() {
   }
 
   function touchPeer(peerId) {
-    setPeers(prev => {
-      const existing = prev.find(p => p.peerId === peerId);
-      if (existing) {
-        return prev.map(p => p.peerId === peerId ? { ...p, lastSeen: Date.now(), connected: true } : p);
-      }
-      return [...prev, { peerId, displayName: peerId, lastSeen: Date.now(), connected: true }];
-    });
+    updatePeer(peerId, { lastSeen: Date.now(), connected: true });
   }
 
   const flushOutbox = useCallback((targetPeerId) => {
@@ -999,6 +1049,44 @@ function App() {
     return deliveryId;
   }
 
+  function toggleLocationShare(peerId, enabled) {
+    if (!peerId) return;
+    if (!enabled) {
+      updatePeer(peerId, { shareOut: false, shareActive: false });
+      sendToPeer(peerId, { type: 'loc_stop' });
+      return;
+    }
+    updatePeer(peerId, { shareOut: true });
+    sendToPeer(peerId, { type: 'loc_share_req' });
+    const peer = peersRef.current.find(p => p.peerId === peerId);
+    if (peer && peer.shareIn) {
+      sendToPeer(peerId, { type: 'loc_share_ack' });
+      updatePeer(peerId, { shareActive: true, shareIn: true });
+    }
+  }
+
+  useEffect(() => {
+    if (!position) return;
+    const interval = setInterval(() => {
+      if (!navigator.onLine) return;
+      const sharePeers = peersRef.current.filter(p => p.shareActive);
+      if (!sharePeers.length) return;
+      const now = Date.now();
+      if (now - lastLocSentRef.current < 4000) return;
+      sharePeers.forEach(p => {
+        sendToPeer(p.peerId, {
+          type: 'loc_update',
+          lat: position.lat,
+          lng: position.lng,
+          ts: now,
+          accuracy: position.accuracy,
+        });
+      });
+      lastLocSentRef.current = now;
+    }, 2000);
+    return () => clearInterval(interval);
+  }, [position]);
+
   useEffect(() => {
     const interval = setInterval(() => {
       Object.entries(connectionsRef.current).forEach(([peerId, conn]) => {
@@ -1034,7 +1122,7 @@ function App() {
     e(Header, { profile, connectionStatus, connectedPeersCount, onReconnect: initPeer }),
     // Main content area
     e('div', { style: { flex: 1, overflow: 'hidden', position: 'relative' } },
-      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
+      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
       activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, settings, peers, categories: allCategories }),
       activeTab === 'geochat' && e(GeochatView, { position, geochatMessages, setGeochatMessages, profile, sendToAllPeers, settings }),
       activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, setMessages, setGeochatMessages, setPeers, categories: allCategories }),
@@ -1131,7 +1219,7 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
 
 // ========================== CHAT VIEW ==========================
 
-function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, unreadCounts, setUnreadCounts, blips, categories }) {
+function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, unreadCounts, setUnreadCounts, blips, categories }) {
   const [connectInput, setConnectInput] = useState('');
   const [showConnect, setShowConnect] = useState(false);
   const [showQR, setShowQR] = useState(false);
@@ -1299,6 +1387,10 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
           const convMsgs = messages[peer.peerId] || [];
           const lastMsg = convMsgs[convMsgs.length - 1];
           const unread = unreadCounts[peer.peerId] || 0;
+          const shareActive = !!peer.shareActive;
+          const shareOut = !!peer.shareOut;
+          const shareLabel = shareActive ? 'Sharing' : shareOut ? 'Pending' : 'Share';
+          const shareTone = shareActive ? 'var(--neon-green)' : shareOut ? 'var(--amber)' : 'var(--text-secondary)';
           return e('div', {
             key: peer.peerId,
             onClick: () => setActiveChatPeer(peer.peerId),
@@ -1316,9 +1408,16 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
                 e('span', { style: { fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' } }, peer.displayName || peer.peerId),
                 lastMsg && e('span', { style: { fontSize: 10, color: 'var(--text-secondary)' } }, timeAgo(lastMsg.timestamp)),
               ),
-              e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 3 } },
-                e('span', { style: { fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 } }, lastMsg ? lastMsg.text : (peer.connected ? 'Connected' : 'Offline')),
-                unread > 0 && e('span', { style: { background: 'var(--magenta)', color: '#fff', fontSize: 10, fontWeight: 700, borderRadius: 10, padding: '2px 7px', minWidth: 18, textAlign: 'center' } }, unread),
+              e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 3, gap: 8 } },
+                e('span', { style: { fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 } }, lastMsg ? lastMsg.text : (peer.connected ? 'Connected' : 'Offline')) ,
+                e('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 } },
+                  e('button', {
+                    onClick: (ev) => { ev.stopPropagation(); toggleLocationShare(peer.peerId, !shareOut); },
+                    className: 'boost-btn',
+                    style: { background: 'transparent', border: '1px solid ' + shareTone, color: shareTone, borderRadius: 999, padding: '2px 8px', fontSize: 10, fontWeight: 600, cursor: 'pointer' }
+                  }, shareLabel),
+                  unread > 0 && e('span', { style: { background: 'var(--magenta)', color: '#fff', fontSize: 10, fontWeight: 700, borderRadius: 10, padding: '2px 7px', minWidth: 18, textAlign: 'center' } }, unread),
+                ),
               ),
             ),
           );
@@ -1385,12 +1484,38 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const leafletMapRef = useRef(null);
   const userMarkerRef = useRef(null);
   const blipLayerRef = useRef(null);
+  const peerLayerRef = useRef(null);
+  const routeLayerRef = useRef(null);
   const tileLayerRef = useRef(null);
   const [showAddBlip, setShowAddBlip] = useState(false);
   const [selectedBlip, setSelectedBlip] = useState(null);
   const [draggingBlipId, setDraggingBlipId] = useState(null);
   const [newBlip, setNewBlip] = useState({ type: 'cool_spot', title: '', desc: '', expiry: 86400000, shareWithPeers: true, dropAtLocation: true });
+  const [showWaypoint, setShowWaypoint] = useState(false);
+  const [routeTarget, setRouteTarget] = useState(null);
+  const [awaitingMapPick, setAwaitingMapPick] = useState(false);
   const allCategories = categories && categories.length ? categories : BLIP_CATEGORIES;
+
+  function buildAltRoute(start, end) {
+    const lat1 = start.lat;
+    const lng1 = start.lng;
+    const lat2 = end.lat;
+    const lng2 = end.lng;
+    const avgLat = (lat1 + lat2) / 2;
+    const dx = (lng2 - lng1) * Math.cos(avgLat * Math.PI / 180);
+    const dy = (lat2 - lat1);
+    const dist = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+    const offset = dist * 0.25;
+    const perpX = -dy / dist;
+    const perpY = dx / dist;
+    const midLat = (lat1 + lat2) / 2 + perpY * offset;
+    const midLng = (lng1 + lng2) / 2 + perpX * offset;
+    return [
+      [lat1, lng1],
+      [midLat, midLng],
+      [lat2, lng2],
+    ];
+  }
 
   // Initialize map
   useEffect(() => {
@@ -1417,6 +1542,8 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     }).addTo(map);
 
     blipLayerRef.current = L.layerGroup().addTo(map);
+    peerLayerRef.current = L.layerGroup().addTo(map);
+    routeLayerRef.current = L.layerGroup().addTo(map);
     leafletMapRef.current = map;
 
     return () => { map.remove(); leafletMapRef.current = null; };
@@ -1449,11 +1576,24 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         iconSize: [20, 20], iconAnchor: [10, 10],
       });
       userMarkerRef.current = L.marker([position.lat, position.lng], { icon, zIndexOffset: 1000 }).addTo(leafletMapRef.current);
+      userMarkerRef.current.on('click', () => setShowWaypoint(true));
       leafletMapRef.current.setView([position.lat, position.lng], settings.map.defaultZoom || 14);
     } else {
       userMarkerRef.current.setLatLng([position.lat, position.lng]);
     }
   }, [position]);
+
+  useEffect(() => {
+    if (!leafletMapRef.current || !awaitingMapPick) return;
+    const map = leafletMapRef.current;
+    function handlePick(ev) {
+      setAwaitingMapPick(false);
+      setRouteTarget({ lat: ev.latlng.lat, lng: ev.latlng.lng, label: 'Custom location' });
+      showToast('Waypoint set', 'var(--neon-green)');
+    }
+    map.on('click', handlePick);
+    return () => map.off('click', handlePick);
+  }, [awaitingMapPick]);
 
   // Update blips on map
   useEffect(() => {
@@ -1497,6 +1637,37 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     });
   }, [blips, settings.map.hiddenCategories]);
 
+  useEffect(() => {
+    if (!peerLayerRef.current) return;
+    peerLayerRef.current.clearLayers();
+    peers.filter(p => p.shareActive && p.lastLoc).forEach(p => {
+      const color = colorFromId(p.peerId);
+      const marker = L.circleMarker([p.lastLoc.lat, p.lastLoc.lng], {
+        radius: 8,
+        color,
+        weight: 2,
+        fillColor: color,
+        fillOpacity: 0.6,
+      });
+      marker.bindTooltip(p.displayName || p.peerId, { direction: 'top', offset: [0, -8], opacity: 0.9 });
+      peerLayerRef.current.addLayer(marker);
+    });
+  }, [peers]);
+
+  useEffect(() => {
+    if (!routeLayerRef.current) return;
+    routeLayerRef.current.clearLayers();
+    if (!routeTarget || !position) return;
+    const start = [position.lat, position.lng];
+    const end = [routeTarget.lat, routeTarget.lng];
+    const directLine = L.polyline([start, end], { color: 'var(--accent)', weight: 4, opacity: 0.9 });
+    const altLine = L.polyline(buildAltRoute(position, routeTarget), { color: 'var(--magenta)', weight: 3, opacity: 0.7, dashArray: '6 8' });
+    const targetMarker = L.circleMarker(end, { radius: 6, color: 'var(--amber)', weight: 2, fillColor: 'var(--amber)', fillOpacity: 0.8 });
+    routeLayerRef.current.addLayer(directLine);
+    routeLayerRef.current.addLayer(altLine);
+    routeLayerRef.current.addLayer(targetMarker);
+  }, [routeTarget, position]);
+
 
   function handleAddBlip() {
     if (!newBlip.title.trim()) { showToast('Give your blip a title!', 'var(--amber)'); return; }
@@ -1539,6 +1710,17 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
 
   // Find selected blip data (fresh from state)
   const selectedBlipData = selectedBlip ? blips.find(b => b.id === selectedBlip) : null;
+  const hiddenCategories = settings.map.hiddenCategories || [];
+  const visibleBlips = blips.filter(b => !hiddenCategories.includes(b.type));
+  const sharePeers = peers.filter(p => p.shareActive && p.lastLoc);
+
+  const routeDistances = useMemo(() => {
+    if (!routeTarget || !position) return null;
+    const direct = haversine(position.lat, position.lng, routeTarget.lat, routeTarget.lng);
+    const altPath = buildAltRoute(position, routeTarget);
+    const alt = haversine(altPath[0][0], altPath[0][1], altPath[1][0], altPath[1][1]) + haversine(altPath[1][0], altPath[1][1], altPath[2][0], altPath[2][1]);
+    return { direct, alt };
+  }, [routeTarget, position]);
 
   return e('div', { style: { height: '100%', position: 'relative' } },
     e('div', { ref: mapContainerRef, style: { width: '100%', height: '100%' } }),
@@ -1555,6 +1737,53 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       peers,
       categories: allCategories,
     }),
+
+    showWaypoint && e('div', {
+      style: { position: 'fixed', inset: 0, zIndex: 9999, display: 'flex', alignItems: 'flex-end', justifyContent: 'center' }
+    },
+      e('div', { onClick: () => setShowWaypoint(false), style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.55)' } }),
+      e('div', {
+        className: 'animate-slide-up',
+        style: {
+          position: 'relative', zIndex: 2, background: 'var(--bg-card)', borderTopLeftRadius: 20, borderTopRightRadius: 20,
+          padding: '16px', width: '100%', maxWidth: 520, border: '1px solid var(--border)', borderBottom: 'none',
+        }
+      },
+        e('div', { style: { width: 40, height: 4, background: 'var(--border)', borderRadius: 2, margin: '0 auto 12px' } }),
+        e('div', { style: { fontWeight: 700, fontSize: 16, color: 'var(--text-primary)', marginBottom: 6 } }, 'Set Waypoint'),
+        e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 } }, 'Choose a target for routing.'),
+        e('div', { style: { marginBottom: 12 } },
+          e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 } }, 'Peers'),
+          sharePeers.length === 0
+            ? e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' } }, 'No shared peers yet.')
+            : sharePeers.map(p => e('button', {
+                key: p.peerId,
+                onClick: () => { setRouteTarget({ lat: p.lastLoc.lat, lng: p.lastLoc.lng, label: p.displayName || p.peerId }); setShowWaypoint(false); },
+                className: 'boost-btn',
+                style: { width: '100%', textAlign: 'left', background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 10, padding: '8px 10px', marginBottom: 6, color: 'var(--text-primary)', cursor: 'pointer' }
+              }, (p.displayName || p.peerId))),
+        ),
+        e('div', { style: { marginBottom: 12 } },
+          e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 } }, 'Blips'),
+          visibleBlips.length === 0
+            ? e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' } }, 'No visible blips.')
+            : visibleBlips.slice(0, 8).map(b => e('button', {
+                key: b.id,
+                onClick: () => { setRouteTarget({ lat: b.lat, lng: b.lng, label: b.title }); setShowWaypoint(false); },
+                className: 'boost-btn',
+                style: { width: '100%', textAlign: 'left', background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 10, padding: '8px 10px', marginBottom: 6, color: 'var(--text-primary)', cursor: 'pointer' }
+              }, b.title)),
+        ),
+        e('div', null,
+          e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 } }, 'Custom'),
+          e('button', {
+            onClick: () => { setShowWaypoint(false); setAwaitingMapPick(true); showToast('Tap map to set waypoint', 'var(--amber)'); },
+            className: 'boost-btn',
+            style: { width: '100%', textAlign: 'left', background: 'var(--bg-deep)', border: '1px dashed var(--border)', borderRadius: 10, padding: '8px 10px', color: 'var(--text-secondary)', cursor: 'pointer' }
+          }, 'Pick on map')
+        ),
+      )
+    ),
 
     // Recenter button
     position && e('button', {
@@ -1575,6 +1804,25 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         fontSize: 11, color: 'var(--text-secondary)',
       }
     }, '📍 ' + blips.length + ' blip' + (blips.length !== 1 ? 's' : '')),
+
+    routeTarget && routeDistances && e('div', {
+      style: {
+        position: 'absolute', bottom: 96, left: 12, right: 12, zIndex: 1000,
+        background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 12, padding: '10px 12px',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12,
+      }
+    },
+      e('div', null,
+        e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginBottom: 2 } }, 'Route to ' + (routeTarget.label || 'Waypoint')) ,
+        e('div', { style: { fontSize: 13, color: 'var(--text-primary)', fontWeight: 600 } }, 'Shortest: ' + distanceStr(routeDistances.direct)),
+        e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, 'Alternative: ' + distanceStr(routeDistances.alt)),
+      ),
+      e('button', {
+        onClick: () => setRouteTarget(null),
+        className: 'boost-btn',
+        style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer' }
+      }, 'Clear'),
+    ),
 
     // FAB - positioned above bottom nav
     !showAddBlip && e('button', {
@@ -2176,6 +2424,36 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(e(App));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
