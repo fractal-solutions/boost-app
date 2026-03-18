@@ -880,6 +880,7 @@ function App() {
   const [activityUnread, setActivityUnread] = useState(0);
   const [swUpdateReady, setSwUpdateReady] = useState(false);
   const [signReady, setSignReady] = useState(false);
+  const lastNonActivityTabRef = useRef('map');
 
   const peerRef = useRef(null);
   const connectionsRef = useRef({});
@@ -1841,12 +1842,21 @@ function App() {
     if (activeTab === 'activity') {
       setActivityUnread(0);
     }
+    if (activeTab && activeTab !== 'activity') {
+      lastNonActivityTabRef.current = activeTab;
+    }
   }, [activeTab]);
 
   // Layout
   return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column', background: 'var(--bg-deep)' } },
     // Header
-    e(Header, { profile, connectionStatus, connectedPeersCount, onReconnect: initPeer }),
+    e(Header, { profile, connectionStatus, connectedPeersCount, onReconnect: initPeer, onOpenActivity: () => {
+      if (activeTab === 'activity') {
+        setActiveTab(lastNonActivityTabRef.current || 'map');
+      } else {
+        setActiveTab('activity');
+      }
+    }, activityUnread }),
     // Main content area
     e('div', { style: { flex: 1, overflow: 'hidden', position: 'relative' } },
       swUpdateReady && e('div', {
@@ -1881,7 +1891,7 @@ function App() {
 
 // ========================== HEADER ==========================
 
-function Header({ profile, connectionStatus, connectedPeersCount, onReconnect }) {
+function Header({ profile, connectionStatus, connectedPeersCount, onReconnect, onOpenActivity, activityUnread }) {
   const statusColor = connectionStatus === 'connected' ? 'var(--neon-green)' : connectionStatus === 'connecting' ? 'var(--amber)' : 'var(--magenta)';
 
   return e('div', {
@@ -1909,6 +1919,17 @@ function Header({ profile, connectionStatus, connectedPeersCount, onReconnect })
       ),
     ),
     e('div', { style: { display: 'flex', alignItems: 'center', gap: 10 } },
+      e('button', {
+        onClick: () => onOpenActivity && onOpenActivity(),
+        className: 'boost-btn',
+        style: {
+          position: 'relative', width: 32, height: 32, borderRadius: '50%',
+          background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--text-secondary)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', fontSize: 14,
+        }
+      }, '🔔',
+        activityUnread > 0 && e('span', { className: 'tab-dot tab-dot-amber', style: { top: 4, right: 4 } })
+      ),
       e('div', { style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: 'var(--text-secondary)' } },
         e('span', { style: { fontSize: 11 } }, connectedPeersCount + ' peer' + (connectedPeersCount !== 1 ? 's' : '')),
       ),
@@ -1932,7 +1953,6 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts, activityUnread }) {
     { id: 'map', label: 'Map' },
     { id: 'feed', label: 'Feed' },
     { id: 'geochat', label: 'Geochat' },
-    { id: 'activity', label: 'Activity' },
     { id: 'settings', label: 'Settings' },
   ];
 
