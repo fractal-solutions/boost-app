@@ -6,6 +6,7 @@ const e = React.createElement;
 const OUTBOX_RETRY_MS = 5000;
 const PING_INTERVAL_MS = 7000;
 const PONG_TIMEOUT_MS = 18000;
+const ACTIVITY_MAX = 200;
 
 function generateId(prefix = '') {
   return prefix + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
@@ -103,6 +104,20 @@ function loadStorageWithMigration(deviceId, base, def) {
     return legacy;
   }
   return def;
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  bytes.forEach((b) => { binary += String.fromCharCode(b); });
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
 }
 
 const IDB_NAME = 'boost_db';
@@ -577,7 +592,7 @@ function QRScannerModal({ onScan, onClose }) {
 
 // ========================== BLIP DETAIL/EDIT MODAL ==========================
 
-function BlipDetailModal({ blip, onClose, onUpdate, onDelete, onRoute, profile, sendToAllPeers, sendToPeer, peers, categories }) {
+function BlipDetailModal({ blip, onClose, onUpdate, onDelete, onRoute, logActivity, profile, sendToAllPeers, sendToPeer, peers, categories }) {
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState(blip.title);
   const [editDesc, setEditDesc] = useState(blip.desc || '');
@@ -617,6 +632,7 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, onRoute, profile, 
     const updated = { ...blip, comments: newComments };
     onUpdate(updated);
     sendToAllPeers({ type: 'blip_comment', blipId: blip.id, comment });
+    if (logActivity) logActivity({ type: 'comment', title: comment.text, peerId: profile.peerId });
   }
 
   function handleBoost() {
@@ -787,6 +803,7 @@ function App() {
   const blipsKey = storageKey('blips', deviceId);
   const geochatKey = storageKey('geochat', deviceId);
   const outboxKey = storageKey('outbox', deviceId);
+  const activityKey = storageKey('activity', deviceId);
   const [profile, setProfile] = useState(() => loadStorage('boost_profile', { displayName: 'Anonymous', peerId: generatePeerId(), avatar: '🙂', createdAt: Date.now() }));
   const [settings, setSettings] = useState(() => {
     const stored = loadStorageWithMigration(deviceId, 'settings', DEFAULT_SETTINGS);
@@ -813,6 +830,7 @@ function App() {
     const stored = loadStorage('boost_geochat', []);
     return stored.filter(m => Date.now() - m.timestamp < 86400000);
   });
+  const [activity, setActivity] = useState(() => loadStorageWithMigration(deviceId, 'activity', []));
   const [lastBackupAt, setLastBackupAt] = useState(() => loadStorage('boost_last_backup_at', 0));
   const [position, setPosition] = useState(null);
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
@@ -825,6 +843,9 @@ function App() {
   const connectionsRef = useRef({});
   const peerHealthRef = useRef({});
   const peersRef = useRef([]);
+  const peerKeysRef = useRef({});
+  const peerPubRef = useRef({});
+  const localKeyRef = useRef({ pair: null, pubJwk: null });
   const lastLocSentRef = useRef(0);
   const mapRef = useRef(null);
   const markersRef = useRef({});
@@ -851,6 +872,7 @@ function App() {
   useEffect(() => { saveStorage(blipsKey, blips); }, [blips]);
   useEffect(() => { saveStorage(geochatKey, geochatMessages); }, [geochatMessages]);
   useEffect(() => { saveStorage(outboxKey, outbox); }, [outbox]);
+  useEffect(() => { saveStorage(activityKey, activity); }, [activity]);
 
   useEffect(() => {
     function handleOnline() {
@@ -875,6 +897,29 @@ function App() {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
     };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stored = loadStorageMaybe('boost_e2e_keys');
+        if (stored && stored.privateJwk && stored.publicJwk) {
+          const priv = await crypto.subtle.importKey('jwk', stored.privateJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
+          const pub = await crypto.subtle.importKey('jwk', stored.publicJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+          if (cancelled) return;
+          localKeyRef.current = { pair: { privateKey: priv, publicKey: pub }, pubJwk: stored.publicJwk };
+          return;
+        }
+        const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
+        const publicJwk = await crypto.subtle.exportKey('jwk', pair.publicKey);
+        const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+        saveStorage('boost_e2e_keys', { publicJwk, privateJwk });
+        if (cancelled) return;
+        localKeyRef.current = { pair, pubJwk: publicJwk };
+      } catch {}
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   // Geolocation
@@ -961,6 +1006,56 @@ function App() {
     });
   }
 
+  function logActivity(entry) {
+    setActivity(prev => {
+      const next = [{ id: generateId('act'), ts: Date.now(), ...entry }, ...prev];
+      return next.slice(0, ACTIVITY_MAX);
+    });
+  }
+
+  async function deriveSharedKey(peerId, peerPubJwk) {
+    try {
+      if (!localKeyRef.current.pair || !peerPubJwk) return null;
+      const peerPub = await crypto.subtle.importKey('jwk', peerPubJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+      const key = await crypto.subtle.deriveKey(
+        { name: 'ECDH', public: peerPub },
+        localKeyRef.current.pair.privateKey,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+      peerKeysRef.current[peerId] = key;
+      peerPubRef.current[peerId] = peerPubJwk;
+      updatePeer(peerId, { secure: true });
+      return key;
+    } catch {
+      return null;
+    }
+  }
+
+  async function encryptForPeer(peerId, data) {
+    const key = peerKeysRef.current[peerId];
+    if (!key || !crypto || !crypto.subtle) return data;
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encoded = new TextEncoder().encode(JSON.stringify(data));
+    const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+    return { type: 'enc', iv: arrayBufferToBase64(iv), payload: arrayBufferToBase64(cipher) };
+  }
+
+  async function decryptFromPeer(peerId, data) {
+    const key = peerKeysRef.current[peerId];
+    if (!key || !crypto || !crypto.subtle) return null;
+    try {
+      const iv = new Uint8Array(base64ToArrayBuffer(data.iv));
+      const payload = base64ToArrayBuffer(data.payload);
+      const decoded = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, payload);
+      const text = new TextDecoder().decode(decoded);
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+
   function isPeerBlocked(peerId) {
     const peer = peersRef.current.find(p => p.peerId === peerId);
     return !!(peer && peer.blocked);
@@ -997,8 +1092,12 @@ function App() {
         }
         return [...prev, { peerId, displayName: peerId, lastSeen: Date.now(), connected: true }];
       });
+      logActivity({ type: 'connect', title: 'Peer connected', peerId });
       // Send introduction
       conn.send({ type: 'intro', displayName: profile.displayName, avatar: profile.avatar });
+      if (localKeyRef.current.pubJwk) {
+        conn.send({ type: 'key_exchange', pub: localKeyRef.current.pubJwk });
+      }
       // Sync existing blips to new peer
       const myBlips = blips.filter(b => !b.isRemote);
       myBlips.forEach(b => {
@@ -1036,8 +1135,13 @@ function App() {
     }
   }
 
-  function handlePeerData(fromPeer, data) {
+  async function handlePeerData(fromPeer, data) {
     if (!data || !data.type) return;
+    if (data.type === 'enc') {
+      const decrypted = await decryptFromPeer(fromPeer, data);
+      if (!decrypted) return;
+      data = decrypted;
+    }
     const blocked = isPeerBlocked(fromPeer);
     if (blocked && data.type !== 'ack') return;
     if (!blocked) touchPeer(fromPeer);
@@ -1048,6 +1152,11 @@ function App() {
     switch (data.type) {
       case 'intro':
         setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, displayName: data.displayName || fromPeer, avatar: data.avatar } : p));
+        break;
+      case 'key_exchange':
+        if (data.pub) {
+          await deriveSharedKey(fromPeer, data.pub);
+        }
         break;
       case 'loc_share_req':
         updatePeer(fromPeer, { shareIn: true, lastSeen: Date.now() });
@@ -1086,6 +1195,8 @@ function App() {
           const convMsgs = prev[fromPeer] || [];
           return { ...prev, [fromPeer]: [...convMsgs, { id: generateId('msg'), text: data.message, sender: fromPeer, timestamp: data.timestamp || Date.now(), blipAttachment: data.blipAttachment || null }] };
         });
+        logActivity({ type: 'chat', title: 'Message', peerId: fromPeer });
+        showToast((data.senderName || fromPeer) + ' sent a message', 'var(--accent)');
         if (activeChatPeer !== fromPeer) {
           setUnreadCounts(prev => ({ ...prev, [fromPeer]: (prev[fromPeer] || 0) + 1 }));
         }
@@ -1097,6 +1208,7 @@ function App() {
             return [...prev, { ...data.blip, isRemote: true }];
           });
           showToast('New blip from ' + (data.blip.creatorName || 'peer'), 'var(--neon-green)');
+          logActivity({ type: 'blip', title: data.blip.title || 'Blip', peerId: fromPeer });
         }
         break;
       case 'blip_update':
@@ -1115,6 +1227,7 @@ function App() {
             return b;
           }));
           showToast('💬 New comment on blip', 'var(--accent)');
+          logActivity({ type: 'comment', title: data.comment.text || 'Comment', peerId: fromPeer });
         }
         break;
       case 'geochat':
@@ -1150,6 +1263,7 @@ function App() {
         break;
       case 'buzz':
         showToast((data.senderName || fromPeer) + ' buzzed you', 'var(--amber)');
+        logActivity({ type: 'buzz', title: 'Buzz', peerId: fromPeer });
         break;
       case 'ping':
         if (connectionsRef.current[fromPeer]) {
@@ -1202,12 +1316,11 @@ function App() {
     });
   }, []);
 
-  function queueOutbox(peerId, payload) {
-    const id = payload.deliveryId || generateId('out');
+  function queueOutbox(peerId, payload, id) {
     const entry = {
       id,
       peerId,
-      payload: { ...payload, deliveryId: id },
+      payload,
       createdAt: Date.now(),
       attempts: 0,
       lastAttempt: 0,
@@ -1217,29 +1330,44 @@ function App() {
   }
 
   function sendToAllPeers(data) {
-    Object.values(connectionsRef.current).forEach(conn => {
-      try { conn.send(data); } catch {}
+    Object.keys(connectionsRef.current).forEach(peerId => {
+      sendToPeer(peerId, data);
     });
   }
 
-  function sendToPeer(peerId, data) {
+  async function sendToPeer(peerId, data) {
     if (isPeerBlocked(peerId)) return;
     const conn = connectionsRef.current[peerId];
     if (conn && conn.open) {
-      try { conn.send(data); } catch {}
+      try {
+        const payload = (data.type === 'ack' || data.type === 'ping' || data.type === 'pong' || data.type === 'key_exchange') ? data : await encryptForPeer(peerId, data);
+        conn.send(payload);
+      } catch {}
     }
   }
 
-  function sendReliableToPeer(peerId, data) {
+  async function sendReliableToPeer(peerId, data) {
     if (isPeerBlocked(peerId)) return null;
-    const deliveryId = queueOutbox(peerId, data);
+    const deliveryId = data.deliveryId || generateId('out');
     const conn = connectionsRef.current[peerId];
     if (!conn || !conn.open) {
+      const payload = { ...data, deliveryId };
+      const wrapped = (data.type === 'ack' || data.type === 'ping' || data.type === 'pong' || data.type === 'key_exchange')
+        ? payload
+        : await encryptForPeer(peerId, payload);
+      queueOutbox(peerId, wrapped, deliveryId);
       connectToPeer(peerId);
       return deliveryId;
     }
     if (navigator.onLine) {
-      try { conn.send({ ...data, deliveryId }); } catch {}
+      try {
+        const payload = { ...data, deliveryId };
+        const wrapped = (data.type === 'ack' || data.type === 'ping' || data.type === 'pong' || data.type === 'key_exchange')
+          ? payload
+          : await encryptForPeer(peerId, payload);
+        queueOutbox(peerId, wrapped, deliveryId);
+        conn.send(wrapped);
+      } catch {}
     }
     return deliveryId;
   }
@@ -1288,6 +1416,7 @@ function App() {
     if (!peerId) return;
     if (isPeerBlocked(peerId)) { showToast('Peer is blocked', 'var(--magenta)'); return; }
     sendReliableToPeer(peerId, { type: 'buzz', timestamp: Date.now(), senderName: profile.displayName });
+    logActivity({ type: 'buzz', title: 'Buzz', peerId });
     if (settings.push && settings.push.enabled && settings.push.serverUrl) {
       const serverUrl = settings.push.serverUrl.replace(/\/$/, '');
       try {
@@ -1416,8 +1545,9 @@ function App() {
     e(Header, { profile, connectionStatus, connectedPeersCount, onReconnect: initPeer }),
     // Main content area
     e('div', { style: { flex: 1, overflow: 'hidden', position: 'relative' } },
-      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
-      activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories: allCategories }),
+      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
+      activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories: allCategories, logActivity }),
+      activeTab === 'activity' && e(ActivityView, { activity, peers }),
       activeTab === 'geochat' && e(GeochatView, { position, geochatMessages, setGeochatMessages, profile, sendToAllPeers, settings }),
       activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, peers, setPeers, categories: allCategories, runDailyBackup }),
     ),
@@ -1478,6 +1608,7 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
     { id: 'chat', label: 'Chat' },
     { id: 'map', label: 'Map' },
     { id: 'geochat', label: 'Geochat' },
+    { id: 'activity', label: 'Activity' },
     { id: 'settings', label: 'Settings' },
   ];
 
@@ -1513,7 +1644,7 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
 
 // ========================== CHAT VIEW ==========================
 
-function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, unreadCounts, setUnreadCounts, blips, categories }) {
+function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories }) {
   const [connectInput, setConnectInput] = useState('');
   const [showConnect, setShowConnect] = useState(false);
   const [showQR, setShowQR] = useState(false);
@@ -1521,6 +1652,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
   const [chatInput, setChatInput] = useState('');
   const [showPeerMenu, setShowPeerMenu] = useState(false);
   const [confirmState, setConfirmState] = useState(null);
+  const [peerListLimit, setPeerListLimit] = useState(30);
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
@@ -1553,6 +1685,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
     const msg = { id: generateId('msg'), text, sender: profile.peerId, timestamp: Date.now(), deliveryId, delivered: false };
     setMessages(prev => ({ ...prev, [activeChatPeer]: [...(prev[activeChatPeer] || []), msg] }));
     sendReliableToPeer(activeChatPeer, { type: 'chat', message: text, timestamp: msg.timestamp, deliveryId });
+    if (logActivity) logActivity({ type: 'chat_out', title: 'Message', peerId: activeChatPeer });
     setChatInput('');
   }
 
@@ -1682,7 +1815,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
           e('div', { style: { fontSize: 15, fontWeight: 500 } }, 'No peers yet'),
           e('div', { style: { fontSize: 12, marginTop: 6 } }, 'Connect to a peer to start chatting'),
         ),
-        peers.map(peer => {
+        peers.slice(0, peerListLimit).map(peer => {
           const convMsgs = messages[peer.peerId] || [];
           const lastMsg = convMsgs[convMsgs.length - 1];
           const unread = unreadCounts[peer.peerId] || 0;
@@ -1721,7 +1854,14 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
               ),
             ),
           );
-        })
+        }),
+        peers.length > peerListLimit && e('div', { style: { textAlign: 'center', padding: '12px 0' } },
+          e('button', {
+            onClick: () => setPeerListLimit(prev => prev + 30),
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 999, padding: '8px 14px', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }
+          }, 'Show More')
+        )
       )
     );
   }
@@ -1769,7 +1909,10 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
       e('div', { style: { width: 36, height: 36, borderRadius: '50%', background: 'var(--bg-card2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, border: '2px solid ' + (peerInfo.connected ? 'var(--neon-green)' : 'var(--border)') } }, peerInfo.avatar || '🙂'),
       e('div', null,
         e('div', { style: { fontWeight: 600, fontSize: 14 } }, peerInfo.displayName),
-        e('div', { style: { fontSize: 10, color: peerBlocked ? 'var(--magenta)' : peerInfo.connected ? 'var(--neon-green)' : 'var(--text-secondary)' } }, peerBlocked ? 'Blocked' : (peerInfo.connected ? 'Online' : 'Offline')),
+        e('div', { style: { fontSize: 10, color: peerBlocked ? 'var(--magenta)' : peerInfo.connected ? 'var(--neon-green)' : 'var(--text-secondary)' } },
+          peerBlocked ? 'Blocked' : (peerInfo.connected ? 'Online' : 'Offline'),
+          peerInfo.secure && e('span', { style: { marginLeft: 6, color: 'var(--accent)', fontWeight: 600 } }, 'Secure')
+        ),
       ),
       e('div', { style: { marginLeft: 'auto', position: 'relative' } },
         e('button', {
@@ -1790,6 +1933,25 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
             disabled: peerBlocked,
             style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--amber)', fontSize: 11, cursor: peerBlocked ? 'not-allowed' : 'pointer', fontWeight: 600, opacity: peerBlocked ? 0.5 : 1, textAlign: 'left' }
           }, 'Buzz'),
+          peerInfo.shareActive && peerInfo.lastLoc && e('button', {
+            onClick: () => {
+              setShowPeerMenu(false);
+              if (peerInfo.lastLoc) {
+                setActiveTab('map');
+                setTimeout(() => {
+                  if (peerInfo.lastLoc) {
+                    window.__boost_open_route && window.__boost_open_route({
+                      lat: peerInfo.lastLoc.lat,
+                      lng: peerInfo.lastLoc.lng,
+                      label: peerInfo.displayName || peerInfo.peerId
+                    });
+                  }
+                }, 50);
+              }
+            },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--accent)', fontSize: 11, cursor: 'pointer', textAlign: 'left' }
+          }, 'Open on Map'),
           e('div', { style: { height: 1, background: 'var(--border)', margin: '4px 0' } }),
           e('button', {
             onClick: () => {
@@ -1877,13 +2039,76 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
   );
 }
 
+// ========================== ACTIVITY VIEW ==========================
+
+function ActivityView({ activity, peers }) {
+  const peerMap = useMemo(() => {
+    const map = {};
+    (peers || []).forEach(p => { map[p.peerId] = p.displayName || p.peerId; });
+    return map;
+  }, [peers]);
+
+  const labelFor = (item) => {
+    const peerName = item.peerId ? (peerMap[item.peerId] || item.peerId) : '';
+    switch (item.type) {
+      case 'chat': return 'Message from ' + peerName;
+      case 'chat_out': return 'Message to ' + peerName;
+      case 'blip': return 'Blip from ' + peerName;
+      case 'comment': return 'Comment from ' + peerName;
+      case 'buzz': return 'Buzz from ' + peerName;
+      case 'connect': return 'Connected to ' + peerName;
+      default: return 'Activity';
+    }
+  };
+
+  const iconFor = (item) => {
+    switch (item.type) {
+      case 'chat':
+      case 'chat_out':
+        return '💬';
+      case 'blip':
+        return '📍';
+      case 'comment':
+        return '🗨️';
+      case 'buzz':
+        return '🔔';
+      case 'connect':
+        return '🤝';
+      default:
+        return '✨';
+    }
+  };
+
+  return e('div', { style: { height: '100%', overflow: 'auto', padding: '12px 16px' } },
+    activity.length === 0 && e('div', { style: { textAlign: 'center', padding: 40, color: 'var(--text-secondary)' } },
+      e('div', { style: { fontSize: 14, fontWeight: 600, marginBottom: 6 } }, 'No activity yet'),
+      e('div', { style: { fontSize: 12 } }, 'Chats, blips, and buzzes will show up here.')
+    ),
+    activity.map(item => e('div', {
+      key: item.id,
+      style: {
+        background: 'var(--bg-card)', borderRadius: 12, padding: '12px 14px', marginBottom: 8,
+        border: '1px solid var(--border)', boxShadow: 'var(--shadow-soft)'
+      }
+    },
+      e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
+        e('span', { style: { fontSize: 14 } }, iconFor(item)),
+        e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, labelFor(item)),
+      ),
+      item.title && item.title !== 'Message' && e('div', { style: { fontSize: 14, color: 'var(--text-primary)', fontWeight: 600 } }, item.title),
+      e('div', { style: { fontSize: 10, color: 'var(--text-secondary)', marginTop: 6 } }, timeAgo(item.ts))
+    ))
+  );
+}
+
 // ========================== MAP VIEW ==========================
 
-function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories }) {
+function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories, logActivity }) {
   const mapContainerRef = useRef(null);
   const leafletMapRef = useRef(null);
   const userMarkerRef = useRef(null);
   const blipLayerRef = useRef(null);
+  const blipMarkersRef = useRef({});
   const peerLayerRef = useRef(null);
   const peerMarkersRef = useRef({});
   const routeLayerRef = useRef(null);
@@ -1900,6 +2125,9 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const [routeLoading, setRouteLoading] = useState(false);
   const [routeActive, setRouteActive] = useState(false);
   const [awaitingMapPick, setAwaitingMapPick] = useState(false);
+  const [blipListLimit, setBlipListLimit] = useState(8);
+  const [tileError, setTileError] = useState(false);
+  const [routeError, setRouteError] = useState(false);
   const allCategories = categories && categories.length ? categories : BLIP_CATEGORIES;
 
   function buildAltRoute(start, end) {
@@ -1946,6 +2174,8 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
       subdomains: 'abcd', maxZoom: 20,
     }).addTo(map);
+    tileLayerRef.current.on('tileerror', () => setTileError(true));
+    tileLayerRef.current.on('load', () => setTileError(false));
 
     blipLayerRef.current = L.layerGroup().addTo(map);
     peerLayerRef.current = L.layerGroup().addTo(map);
@@ -1969,6 +2199,8 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
       subdomains: 'abcd', maxZoom: 20,
     }).addTo(leafletMapRef.current);
+    tileLayerRef.current.on('tileerror', () => setTileError(true));
+    tileLayerRef.current.on('load', () => setTileError(false));
   }, [settings.ui && settings.ui.theme]);
 
   // Update user position
@@ -2005,6 +2237,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     if (!routeTarget || !position) {
       setRouteData(null);
       setRouteLoading(false);
+      setRouteError(false);
       lastRouteKeyRef.current = null;
       return;
     }
@@ -2026,18 +2259,22 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     const end = routeTarget.lng + ',' + routeTarget.lat;
     const url = 'https://router.project-osrm.org/route/v1/driving/' + start + ';' + end + '?overview=full&geometries=geojson&alternatives=true&steps=false';
     setRouteLoading(true);
+    setRouteError(false);
     fetch(url, { signal: controller.signal })
       .then(res => res.json())
       .then(data => {
         if (data && data.routes && data.routes.length) {
           setRouteData(data);
+          setRouteError(false);
         } else {
           setRouteData(null);
+          setRouteError(true);
         }
       })
       .catch(err => {
         if (err && err.name === 'AbortError') return;
         setRouteData(null);
+        setRouteError(true);
         showToast('Routing unavailable', 'var(--amber)');
       })
       .finally(() => setRouteLoading(false));
@@ -2046,10 +2283,14 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   // Update blips on map
   useEffect(() => {
     if (!blipLayerRef.current) return;
-    blipLayerRef.current.clearLayers();
-
+    const layer = blipLayerRef.current;
+    const markers = blipMarkersRef.current;
     const hidden = settings.map.hiddenCategories || [];
-    blips.filter(b => !hidden.includes(b.type)).forEach(blip => {
+    const visible = blips.filter(b => !hidden.includes(b.type));
+    const activeIds = new Set();
+
+    visible.forEach(blip => {
+      activeIds.add(blip.id);
       const cat = getCat(blip.type, allCategories);
       const isExpiring = blip.expiresAt && (blip.expiresAt - Date.now()) < 3600000;
       const isMine = blip.creator === profile.peerId;
@@ -2060,28 +2301,38 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         iconSize: [36, 36], iconAnchor: [18, 18],
       });
 
-      const marker = L.marker([blip.lat, blip.lng], { icon, draggable: isMine }).addTo(blipLayerRef.current);
-
-      // Drag support for own blips
-      if (isMine) {
-        marker.on('dragend', function(ev) {
-          const newPos = ev.target.getLatLng();
-          setBlips(prev => prev.map(b => {
-            if (b.id === blip.id) {
-              const updated = { ...b, lat: newPos.lat, lng: newPos.lng };
-              sendToAllPeers({ type: 'blip_update', blip: updated });
-              return updated;
-            }
-            return b;
-          }));
-          showToast('📍 Blip moved!', 'var(--neon-green)');
+      let marker = markers[blip.id];
+      if (!marker) {
+        marker = L.marker([blip.lat, blip.lng], { icon, draggable: isMine }).addTo(layer);
+        marker.on('click', function() {
+          setSelectedBlip(blip.id);
         });
+        if (isMine) {
+          marker.on('dragend', function(ev) {
+            const newPos = ev.target.getLatLng();
+            setBlips(prev => prev.map(b => {
+              if (b.id === blip.id) {
+                const updated = { ...b, lat: newPos.lat, lng: newPos.lng };
+                sendToAllPeers({ type: 'blip_update', blip: updated });
+                return updated;
+              }
+              return b;
+            }));
+            showToast('📍 Blip moved!', 'var(--neon-green)');
+          });
+        }
+        markers[blip.id] = marker;
+      } else {
+        marker.setLatLng([blip.lat, blip.lng]);
+        marker.setIcon(icon);
       }
+    });
 
-      // Click to open detail
-      marker.on('click', function() {
-        setSelectedBlip(blip.id);
-      });
+    Object.keys(markers).forEach(id => {
+      if (!activeIds.has(id)) {
+        layer.removeLayer(markers[id]);
+        delete markers[id];
+      }
     });
   }, [blips, settings.map.hiddenCategories]);
 
@@ -2186,6 +2437,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     };
 
     setBlips(prev => [...prev, blip]);
+    if (logActivity) logActivity({ type: 'blip', title: blip.title, peerId: profile.peerId });
 
     if (newBlip.shareWithPeers) {
       sendToAllPeers({ type: 'blip', blip });
@@ -2213,6 +2465,14 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const hiddenCategories = settings.map.hiddenCategories || [];
   const visibleBlips = blips.filter(b => !hiddenCategories.includes(b.type));
   const sharePeers = peers.filter(p => p.shareActive && p.lastLoc);
+  useEffect(() => {
+    window.__boost_open_route = (target) => {
+      if (!target) return;
+      setRouteTarget({ lat: target.lat, lng: target.lng, label: target.label || 'Peer' });
+      setRouteActive(false);
+    };
+    return () => { if (window.__boost_open_route) delete window.__boost_open_route; };
+  }, []);
 
   const routeDistances = useMemo(() => {
     if (!routeTarget || !position) return null;
@@ -2229,6 +2489,13 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
 
   return e('div', { style: { height: '100%', position: 'relative' } },
     e('div', { ref: mapContainerRef, style: { width: '100%', height: '100%' } }),
+    (tileError || !navigator.onLine) && e('div', {
+      style: {
+        position: 'absolute', top: 12, left: 12, right: 12, zIndex: 1000,
+        background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10, padding: '8px 10px',
+        fontSize: 11, color: 'var(--text-secondary)', textAlign: 'center'
+      }
+    }, !navigator.onLine ? 'Offline mode: map tiles may be unavailable' : 'Limited mode: map tiles unavailable'),
 
     // Blip detail modal
     selectedBlipData && e(BlipDetailModal, {
@@ -2240,6 +2507,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         setRouteTarget({ lat: blip.lat, lng: blip.lng, label: blip.title });
         setRouteActive(false);
       },
+      logActivity,
       profile,
       sendToAllPeers,
       sendToPeer,
@@ -2276,12 +2544,17 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
           e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 } }, 'Blips'),
           visibleBlips.length === 0
             ? e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' } }, 'No visible blips.')
-            : visibleBlips.slice(0, 8).map(b => e('button', {
+            : visibleBlips.slice(0, blipListLimit).map(b => e('button', {
                 key: b.id,
                 onClick: () => { setRouteTarget({ lat: b.lat, lng: b.lng, label: b.title }); setShowWaypoint(false); },
                 className: 'boost-btn',
                 style: { width: '100%', textAlign: 'left', background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 10, padding: '8px 10px', marginBottom: 6, color: 'var(--text-primary)', cursor: 'pointer' }
               }, b.title)),
+          visibleBlips.length > blipListLimit && e('button', {
+            onClick: () => setBlipListLimit(prev => prev + 8),
+            className: 'boost-btn',
+            style: { width: '100%', textAlign: 'center', background: 'var(--bg-deep)', border: '1px dashed var(--border)', borderRadius: 10, padding: '8px 10px', color: 'var(--text-secondary)', cursor: 'pointer' }
+          }, 'Show More Blips'),
         ),
         e('div', null,
           e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 } }, 'Custom'),
@@ -2324,6 +2597,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       e('div', null,
         e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginBottom: 2 } }, 'Route to ' + (routeTarget.label || 'Waypoint')),
         routeLoading && e('div', { style: { fontSize: 10, color: 'var(--text-secondary)', marginBottom: 4 } }, 'Calculating route...'),
+        routeError && e('div', { style: { fontSize: 10, color: 'var(--amber)', marginBottom: 4 } }, 'Using estimate (routing unavailable)'),
         e('div', { style: { fontSize: 13, color: 'var(--text-primary)', fontWeight: 600 } }, 'Shortest: ' + distanceStr(routeDistances.direct)),
         e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, 'Alternative: ' + (routeDistances.alt !== null ? distanceStr(routeDistances.alt) : '--')),
       ),
