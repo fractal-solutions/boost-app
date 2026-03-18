@@ -1,4 +1,4 @@
-const { useState, useEffect, useRef, useCallback, useMemo } = React;
+﻿const { useState, useEffect, useRef, useCallback, useMemo } = React;
 const e = React.createElement;
 
 // ========================== UTILS ==========================
@@ -75,6 +75,118 @@ function loadStorage(key, def) {
 }
 function saveStorage(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
+function loadStorageMaybe(key) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : undefined; } catch { return undefined; }
+}
+
+function getDeviceId() {
+  const existing = loadStorageMaybe('boost_device_id');
+  if (existing) return existing;
+  const id = generateId('dev_');
+  saveStorage('boost_device_id', id);
+  return id;
+}
+
+function storageKey(base, deviceId) {
+  return 'boost_' + deviceId + '_' + base;
+}
+
+function loadStorageWithMigration(deviceId, base, def) {
+  const nextKey = storageKey(base, deviceId);
+  const legacyKey = 'boost_' + base;
+  const current = loadStorageMaybe(nextKey);
+  if (current !== undefined) return current;
+  const legacy = loadStorageMaybe(legacyKey);
+  if (legacy !== undefined) {
+    saveStorage(nextKey, legacy);
+    return legacy;
+  }
+  return def;
+}
+
+const IDB_NAME = 'boost_db';
+const IDB_STORE = 'handles';
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+        req.result.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGet(key) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const store = tx.objectStore(IDB_STORE);
+    const req = store.get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbSet(key, val) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    const store = tx.objectStore(IDB_STORE);
+    const req = store.put(val, key);
+    req.onsuccess = () => resolve(true);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function sanitizeFilename(name) {
+  return (name || 'user').toString().trim().replace(/[^a-z0-9-_]+/gi, '_');
+}
+
+async function getBackupDirHandle() {
+  try {
+    return await idbGet('backupDir');
+  } catch {
+    return null;
+  }
+}
+
+async function writeBackupToFolder(payload, name, interactive = false) {
+  if (!window.showDirectoryPicker) return false;
+  const root = await getBackupDirHandle();
+  if (!root) return false;
+  try {
+    const perm = await root.queryPermission({ mode: 'readwrite' });
+    if (perm !== 'granted') {
+      if (!interactive) return false;
+      const req = await root.requestPermission({ mode: 'readwrite' });
+      if (req !== 'granted') return false;
+    }
+    const subdir = await root.getDirectoryHandle('boost', { create: true });
+    const safeName = sanitizeFilename(name);
+    const fileHandle = await subdir.getFileHandle(`boost-backup(${safeName}).json`, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(JSON.stringify(payload, null, 2));
+    await writable.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
 }
 
 // Simple QR Code generator (alphanumeric)
@@ -162,10 +274,10 @@ function getCat(id, categories = BLIP_CATEGORIES) {
 }
 
 function getCategoryIcon(cat) {
-  if (!cat) return '•';
+  if (!cat) return '❓';
   if (cat.icon) return cat.icon;
   const label = (cat.label || '').trim();
-  return label ? label[0].toUpperCase() : '•';
+  return label ? label[0].toUpperCase() : '❓';
 }
 
 function withAlpha(color, hex) {
@@ -192,6 +304,8 @@ const DEFAULT_SETTINGS = {
   geochat: { enabled: false, zoneRadius: 1000, anonymous: true, messageExpiry: 24 },
   map: { defaultZoom: 14, hiddenCategories: [], darkTiles: true },
   ui: { theme: 'obsidian' },
+  push: { enabled: false, serverUrl: '', vapidPublicKey: '' },
+  backup: { enabled: false, name: '' },
   customBlipTypes: [],
 };
 
@@ -406,7 +520,7 @@ function QRScannerModal({ onScan, onClose }) {
           }
         }),
         e('div', { style: { position: 'absolute', bottom: 10, left: 0, right: 0, textAlign: 'center', fontSize: 12, color: 'var(--text-secondary)' } },
-          'QR scanning requires a QR library — use manual entry below'
+          'QR scanning requires a QR library - use manual entry below'
         ),
       ),
 
@@ -436,7 +550,7 @@ function QRScannerModal({ onScan, onClose }) {
 
 // ========================== BLIP DETAIL/EDIT MODAL ==========================
 
-function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAllPeers, sendToPeer, peers, categories }) {
+function BlipDetailModal({ blip, onClose, onUpdate, onDelete, onRoute, profile, sendToAllPeers, sendToPeer, peers, categories }) {
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState(blip.title);
   const [editDesc, setEditDesc] = useState(blip.desc || '');
@@ -482,7 +596,7 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
     const updated = { ...blip, boosts: (blip.boosts || 0) + 1 };
     onUpdate(updated);
     sendToAllPeers({ type: 'blip_boost', blipId: blip.id });
-    showToast('🔥 Boosted!', 'var(--amber)');
+    showToast('⚡ Boosted!', 'var(--amber)');
   }
 
   return e('div', {
@@ -493,7 +607,7 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
       className: 'animate-slide-up',
       style: {
         position: 'relative', zIndex: 2, background: 'var(--bg-card)', borderTopLeftRadius: 20, borderTopRightRadius: 20,
-        padding: '20px 16px', width: '100%', maxWidth: 500, maxHeight: '85vh', overflow: 'auto',
+        padding: '20px 16px', width: '100%', maxWidth: 500, maxHeight: '70vh', overflow: 'auto',
         border: '1px solid var(--border)', borderBottom: 'none',
       }
     },
@@ -521,21 +635,23 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
             ),
           ),
         ),
-        e('div', { style: { display: 'flex', gap: 6 } },
+        e('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
           isMine && !editing && e('button', {
             onClick: () => setEditing(true),
             className: 'boost-btn',
             style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', color: 'var(--accent)', fontSize: 12, cursor: 'pointer' }
           }, '✏️ Edit'),
+          e('button', {
+            onClick: () => { if (onRoute) { onRoute(blip); onClose(); } },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', color: 'var(--accent)', fontSize: 12, cursor: 'pointer' }
+          }, 'Route'),
+          e('div', { style: { flex: 1 } }),
           isMine && e('button', {
-            onClick: () => { onDelete(blip.id); onClose(); showToast('Blip removed', 'var(--magenta)'); },
+            onClick: () => { onDelete(blip); onClose(); showToast('Blip removed', 'var(--magenta)'); },
             className: 'boost-btn',
             style: { background: 'var(--bg-card2)', border: '1px solid var(--magenta)', borderRadius: 8, padding: '6px 10px', color: 'var(--magenta)', fontSize: 12, cursor: 'pointer' }
           }, '🗑️'),
-          e('button', {
-            onClick: onClose,
-            style: { background: 'none', border: 'none', color: 'var(--text-secondary)', fontSize: 20, cursor: 'pointer' }
-          }, '✕'),
         ),
       ),
 
@@ -586,7 +702,7 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
           onClick: handleBoost,
           className: 'boost-btn',
           style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--amber)', background: 'var(--amber)15', border: '1px solid var(--amber)40', borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }
-        }, '🔥 ' + (blip.boosts || 0) + ' Boost' + ((blip.boosts || 0) !== 1 ? 's' : '')),
+        }, '⚡ ' + (blip.boosts || 0) + ' Boost' + ((blip.boosts || 0) !== 1 ? 's' : '')),
       ),
 
       // Comments section
@@ -625,7 +741,7 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
             onClick: handleComment,
             className: 'boost-btn',
             style: { background: 'var(--accent)', color: 'var(--bg-deep)', border: 'none', borderRadius: '50%', width: 36, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', fontSize: 14, fontWeight: 700, flexShrink: 0 }
-          }, '↑'),
+          }, '➤'),
         ),
       ),
     ),
@@ -637,9 +753,16 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
 
 function App() {
   const [activeTab, setActiveTab] = useState('map');
-  const [profile, setProfile] = useState(() => loadStorage('boost_profile', { displayName: 'Anonymous', peerId: generatePeerId(), avatar: '⚡', createdAt: Date.now() }));
+  const deviceId = useMemo(() => getDeviceId(), []);
+  const settingsKey = storageKey('settings', deviceId);
+  const peersKey = storageKey('peers', deviceId);
+  const messagesKey = storageKey('messages', deviceId);
+  const blipsKey = storageKey('blips', deviceId);
+  const geochatKey = storageKey('geochat', deviceId);
+  const outboxKey = storageKey('outbox', deviceId);
+  const [profile, setProfile] = useState(() => loadStorage('boost_profile', { displayName: 'Anonymous', peerId: generatePeerId(), avatar: '🙂', createdAt: Date.now() }));
   const [settings, setSettings] = useState(() => {
-    const stored = loadStorage('boost_settings', DEFAULT_SETTINGS);
+    const stored = loadStorageWithMigration(deviceId, 'settings', DEFAULT_SETTINGS);
     return {
       ...DEFAULT_SETTINGS,
       ...stored,
@@ -648,24 +771,27 @@ function App() {
       geochat: { ...DEFAULT_SETTINGS.geochat, ...(stored.geochat || {}) },
       map: { ...DEFAULT_SETTINGS.map, ...(stored.map || {}) },
       ui: { ...DEFAULT_SETTINGS.ui, ...(stored.ui || {}) },
+      push: { ...DEFAULT_SETTINGS.push, ...(stored.push || {}) },
+      backup: { ...DEFAULT_SETTINGS.backup, ...(stored.backup || {}) },
       customBlipTypes: stored.customBlipTypes || [],
     };
   });
-  const [peers, setPeers] = useState(() => loadStorage('boost_peers', []));
-  const [messages, setMessages] = useState(() => loadStorage('boost_messages', {}));
+  const [peers, setPeers] = useState(() => loadStorageWithMigration(deviceId, 'peers', []));
+  const [messages, setMessages] = useState(() => loadStorageWithMigration(deviceId, 'messages', {}));
   const [blips, setBlips] = useState(() => {
-    const stored = loadStorage('boost_blips', []);
+    const stored = loadStorageWithMigration(deviceId, 'blips', []);
     return stored.filter(b => !b.expiresAt || b.expiresAt > Date.now());
   });
   const [geochatMessages, setGeochatMessages] = useState(() => {
     const stored = loadStorage('boost_geochat', []);
     return stored.filter(m => Date.now() - m.timestamp < 86400000);
   });
+  const [lastBackupAt, setLastBackupAt] = useState(() => loadStorage('boost_last_backup_at', 0));
   const [position, setPosition] = useState(null);
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [activeChatPeer, setActiveChatPeer] = useState(null);
   const [unreadCounts, setUnreadCounts] = useState({});
-  const [outbox, setOutbox] = useState(() => loadStorage('boost_outbox', []));
+  const [outbox, setOutbox] = useState(() => loadStorageWithMigration(deviceId, 'outbox', []));
   const [networkOnline, setNetworkOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
 
   const peerRef = useRef(null);
@@ -678,7 +804,8 @@ function App() {
 
   // Save to localStorage on changes
   useEffect(() => { saveStorage('boost_profile', profile); }, [profile]);
-  useEffect(() => { saveStorage('boost_settings', settings); }, [settings]);
+  useEffect(() => { saveStorage(settingsKey, settings); }, [settings]);
+  useEffect(() => { saveStorage('boost_last_backup_at', lastBackupAt); }, [lastBackupAt]);
   useEffect(() => {
     const theme = (settings.ui && settings.ui.theme) || 'obsidian';
     const root = document.body;
@@ -687,12 +814,12 @@ function App() {
   }, [settings.ui && settings.ui.theme]);
 
   const allCategories = useMemo(() => getAllCategories(settings.customBlipTypes), [settings.customBlipTypes]);
-  useEffect(() => { saveStorage('boost_peers', peers); }, [peers]);
+  useEffect(() => { saveStorage(peersKey, peers); }, [peers]);
   useEffect(() => { peersRef.current = peers; }, [peers]);
-  useEffect(() => { saveStorage('boost_messages', messages); }, [messages]);
-  useEffect(() => { saveStorage('boost_blips', blips); }, [blips]);
-  useEffect(() => { saveStorage('boost_geochat', geochatMessages); }, [geochatMessages]);
-  useEffect(() => { saveStorage('boost_outbox', outbox); }, [outbox]);
+  useEffect(() => { saveStorage(messagesKey, messages); }, [messages]);
+  useEffect(() => { saveStorage(blipsKey, blips); }, [blips]);
+  useEffect(() => { saveStorage(geochatKey, geochatMessages); }, [geochatMessages]);
+  useEffect(() => { saveStorage(outboxKey, outbox); }, [outbox]);
 
   useEffect(() => {
     function handleOnline() {
@@ -768,7 +895,7 @@ function App() {
       setProfile(p => ({ ...p, peerId: id }));
       // Reconnect to known peers
       peers.forEach(p => {
-        if (!connectionsRef.current[p.peerId]) {
+        if (!connectionsRef.current[p.peerId] && !p.blocked) {
           connectToPeer(p.peerId);
         }
       });
@@ -803,8 +930,32 @@ function App() {
     });
   }
 
+  function isPeerBlocked(peerId) {
+    const peer = peersRef.current.find(p => p.peerId === peerId);
+    return !!(peer && peer.blocked);
+  }
+
+  function blockPeer(peerId, shouldBlock) {
+    if (!peerId) return;
+    if (shouldBlock) {
+      try { sendToPeer(peerId, { type: 'loc_stop' }); } catch {}
+      if (connectionsRef.current[peerId]) {
+        try { connectionsRef.current[peerId].close(); } catch {}
+        delete connectionsRef.current[peerId];
+      }
+      updatePeer(peerId, { blocked: true, connected: false, shareOut: false, shareIn: false, shareActive: false });
+      setOutbox(prev => prev.filter(item => item.peerId !== peerId));
+    } else {
+      updatePeer(peerId, { blocked: false });
+    }
+  }
+
   function handleConnection(conn) {
     const peerId = conn.peer;
+    if (isPeerBlocked(peerId)) {
+      try { conn.close(); } catch {}
+      return;
+    }
     connectionsRef.current[peerId] = conn;
     peerHealthRef.current[peerId] = { lastPong: Date.now() };
 
@@ -845,6 +996,7 @@ function App() {
     if (!peerRef.current || peerRef.current.destroyed) return;
     if (connectionsRef.current[peerId]) return;
     if (peerId === profile.peerId) { showToast("Can't connect to yourself!", 'var(--magenta)'); return; }
+    if (isPeerBlocked(peerId)) { showToast('Peer is blocked', 'var(--magenta)'); return; }
     try {
       const conn = peerRef.current.connect(peerId, { reliable: true });
       handleConnection(conn);
@@ -855,7 +1007,9 @@ function App() {
 
   function handlePeerData(fromPeer, data) {
     if (!data || !data.type) return;
-    touchPeer(fromPeer);
+    const blocked = isPeerBlocked(fromPeer);
+    if (blocked && data.type !== 'ack') return;
+    if (!blocked) touchPeer(fromPeer);
     if (data.deliveryId && data.type !== 'ack') {
       try { connectionsRef.current[fromPeer] && connectionsRef.current[fromPeer].send({ type: 'ack', deliveryId: data.deliveryId }); } catch {}
     }
@@ -958,6 +1112,14 @@ function App() {
           setBlips(prev => prev.map(b => b.id === data.blipId ? { ...b, boosts: (b.boosts || 0) + 1 } : b));
         }
         break;
+      case 'blip_delete':
+        if (data.blipId) {
+          setBlips(prev => prev.filter(b => b.id !== data.blipId));
+        }
+        break;
+      case 'buzz':
+        showToast((data.senderName || fromPeer) + ' buzzed you', 'var(--amber)');
+        break;
       case 'ping':
         if (connectionsRef.current[fromPeer]) {
           connectionsRef.current[fromPeer].send({ type: 'pong' });
@@ -1030,6 +1192,7 @@ function App() {
   }
 
   function sendToPeer(peerId, data) {
+    if (isPeerBlocked(peerId)) return;
     const conn = connectionsRef.current[peerId];
     if (conn && conn.open) {
       try { conn.send(data); } catch {}
@@ -1037,6 +1200,7 @@ function App() {
   }
 
   function sendReliableToPeer(peerId, data) {
+    if (isPeerBlocked(peerId)) return null;
     const deliveryId = queueOutbox(peerId, data);
     const conn = connectionsRef.current[peerId];
     if (!conn || !conn.open) {
@@ -1049,8 +1213,85 @@ function App() {
     return deliveryId;
   }
 
+  function sendReliableToAllPeers(data) {
+    peersRef.current.forEach(p => {
+      if (p.peerId && p.peerId !== profile.peerId) {
+        sendReliableToPeer(p.peerId, data);
+      }
+    });
+  }
+
+  function buildBackupPayload() {
+    return {
+      version: 1,
+      profile: { displayName: profile.displayName, avatar: profile.avatar, createdAt: profile.createdAt },
+      settings,
+      peers,
+      messages,
+      blips,
+      geochatMessages,
+    };
+  }
+
+  async function runDailyBackup(force = false, interactive = false) {
+    if (!settings.backup || !settings.backup.enabled) return;
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const lastKey = lastBackupAt ? new Date(lastBackupAt).toISOString().slice(0, 10) : null;
+    if (!force && lastKey === todayKey) return;
+    const name = settings.backup.name || profile.displayName || profile.peerId || 'user';
+    const ok = await writeBackupToFolder(buildBackupPayload(), name, interactive);
+    if (ok) {
+      setLastBackupAt(Date.now());
+      if (interactive) showToast('Backup saved', 'var(--neon-green)');
+    } else if (interactive) {
+      showToast('Backup folder not set', 'var(--amber)');
+    }
+  }
+
+  async function buzzPeer(peerId) {
+    if (!peerId) return;
+    if (isPeerBlocked(peerId)) { showToast('Peer is blocked', 'var(--magenta)'); return; }
+    sendReliableToPeer(peerId, { type: 'buzz', timestamp: Date.now(), senderName: profile.displayName });
+    if (settings.push && settings.push.enabled && settings.push.serverUrl) {
+      const serverUrl = settings.push.serverUrl.replace(/\/$/, '');
+      try {
+        await fetch(serverUrl + '/buzz', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ to: peerId, from: profile.peerId, senderName: profile.displayName }),
+        });
+      } catch {}
+    }
+    showToast('Buzz sent', 'var(--amber)');
+  }
+
+  function removePeer(peerId, deleteHistory) {
+    if (!peerId) return;
+    try { sendToPeer(peerId, { type: 'loc_stop' }); } catch {}
+    if (connectionsRef.current[peerId]) {
+      try { connectionsRef.current[peerId].close(); } catch {}
+      delete connectionsRef.current[peerId];
+    }
+    setPeers(prev => prev.filter(p => p.peerId !== peerId));
+    setUnreadCounts(prev => {
+      const next = { ...prev };
+      delete next[peerId];
+      return next;
+    });
+    setOutbox(prev => prev.filter(item => item.peerId !== peerId));
+    if (deleteHistory) {
+      setMessages(prev => {
+        const next = { ...prev };
+        delete next[peerId];
+        return next;
+      });
+      setBlips(prev => prev.filter(b => b.creator !== peerId));
+    }
+  }
+
   function toggleLocationShare(peerId, enabled) {
     if (!peerId) return;
+    if (isPeerBlocked(peerId)) { showToast('Peer is blocked', 'var(--magenta)'); return; }
     if (!enabled) {
       updatePeer(peerId, { shareOut: false, shareActive: false });
       sendToPeer(peerId, { type: 'loc_stop' });
@@ -1106,6 +1347,12 @@ function App() {
     return () => clearInterval(interval);
   }, [flushOutbox]);
 
+  useEffect(() => {
+    runDailyBackup(false, false);
+    const interval = setInterval(() => { runDailyBackup(false, false); }, 60 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [settings.backup && settings.backup.enabled, settings.backup && settings.backup.name, profile.displayName, profile.peerId, blips, peers, messages, geochatMessages, settings, lastBackupAt]);
+
   // Blip expiry check
   useEffect(() => {
     const interval = setInterval(() => {
@@ -1122,10 +1369,10 @@ function App() {
     e(Header, { profile, connectionStatus, connectedPeersCount, onReconnect: initPeer }),
     // Main content area
     e('div', { style: { flex: 1, overflow: 'hidden', position: 'relative' } },
-      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
-      activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, settings, peers, categories: allCategories }),
+      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
+      activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories: allCategories }),
       activeTab === 'geochat' && e(GeochatView, { position, geochatMessages, setGeochatMessages, profile, sendToAllPeers, settings }),
-      activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, setMessages, setGeochatMessages, setPeers, categories: allCategories }),
+      activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, peers, setPeers, categories: allCategories, runDailyBackup }),
     ),
     // Bottom nav
     e(BottomNav, { activeTab, setActiveTab, unreadCounts })
@@ -1219,12 +1466,14 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
 
 // ========================== CHAT VIEW ==========================
 
-function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, unreadCounts, setUnreadCounts, blips, categories }) {
+function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, unreadCounts, setUnreadCounts, blips, categories }) {
   const [connectInput, setConnectInput] = useState('');
   const [showConnect, setShowConnect] = useState(false);
   const [showQR, setShowQR] = useState(false);
   const [showScanner, setShowScanner] = useState(false);
   const [chatInput, setChatInput] = useState('');
+  const [showPeerMenu, setShowPeerMenu] = useState(false);
+  const [confirmState, setConfirmState] = useState(null);
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
@@ -1237,6 +1486,8 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
     if (activeChatPeer) {
       setUnreadCounts(prev => ({ ...prev, [activeChatPeer]: 0 }));
     }
+    setShowPeerMenu(false);
+    setConfirmState(null);
   }, [activeChatPeer]);
 
   function handleConnect() {
@@ -1257,6 +1508,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
     sendReliableToPeer(activeChatPeer, { type: 'chat', message: text, timestamp: msg.timestamp, deliveryId });
     setChatInput('');
   }
+
 
   function handleShareVia(method) {
     const peerId = profile.peerId;
@@ -1379,7 +1631,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
       // Conversations
       e('div', { style: { flex: 1, overflow: 'auto', padding: '8px 16px' } },
         peers.length === 0 && e('div', { style: { textAlign: 'center', padding: 40, color: 'var(--text-secondary)' } },
-          e('div', { style: { fontSize: 48, marginBottom: 12 } }, '📡'),
+          e('div', { style: { fontSize: 48, marginBottom: 12 } }, '🤝'),
           e('div', { style: { fontSize: 15, fontWeight: 500 } }, 'No peers yet'),
           e('div', { style: { fontSize: 12, marginTop: 6 } }, 'Connect to a peer to start chatting'),
         ),
@@ -1389,8 +1641,9 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
           const unread = unreadCounts[peer.peerId] || 0;
           const shareActive = !!peer.shareActive;
           const shareOut = !!peer.shareOut;
-          const shareLabel = shareActive ? 'Sharing' : shareOut ? 'Pending' : 'Share';
-          const shareTone = shareActive ? 'var(--neon-green)' : shareOut ? 'var(--amber)' : 'var(--text-secondary)';
+          const blocked = !!peer.blocked;
+          const shareLabel = blocked ? 'Blocked' : shareActive ? 'Sharing' : shareOut ? 'Pending' : 'Share';
+          const shareTone = blocked ? 'var(--magenta)' : shareActive ? 'var(--neon-green)' : shareOut ? 'var(--amber)' : 'var(--text-secondary)';
           return e('div', {
             key: peer.peerId,
             onClick: () => setActiveChatPeer(peer.peerId),
@@ -1402,7 +1655,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
             onMouseEnter: (ev) => { ev.currentTarget.style.borderColor = 'var(--accent)'; ev.currentTarget.style.boxShadow = '0 0 12px rgba(0,240,255,0.1)'; },
             onMouseLeave: (ev) => { ev.currentTarget.style.borderColor = 'var(--border)'; ev.currentTarget.style.boxShadow = 'none'; },
           },
-            e('div', { style: { width: 44, height: 44, borderRadius: '50%', background: 'var(--bg-card2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, flexShrink: 0, border: '2px solid ' + (peer.connected ? 'var(--neon-green)' : 'var(--border)') } }, peer.avatar || '👤'),
+            e('div', { style: { width: 44, height: 44, borderRadius: '50%', background: 'var(--bg-card2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, flexShrink: 0, border: '2px solid ' + (peer.connected ? 'var(--neon-green)' : 'var(--border)') } }, peer.avatar || '🙂'),
             e('div', { style: { flex: 1, minWidth: 0 } },
               e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
                 e('span', { style: { fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' } }, peer.displayName || peer.peerId),
@@ -1412,9 +1665,9 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
                 e('span', { style: { fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 } }, lastMsg ? lastMsg.text : (peer.connected ? 'Connected' : 'Offline')) ,
                 e('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 } },
                   e('button', {
-                    onClick: (ev) => { ev.stopPropagation(); toggleLocationShare(peer.peerId, !shareOut); },
+                    onClick: (ev) => { ev.stopPropagation(); if (!blocked) toggleLocationShare(peer.peerId, !shareOut); },
                     className: 'boost-btn',
-                    style: { background: 'transparent', border: '1px solid ' + shareTone, color: shareTone, borderRadius: 999, padding: '2px 8px', fontSize: 10, fontWeight: 600, cursor: 'pointer' }
+                    style: { background: 'transparent', border: '1px solid ' + shareTone, color: shareTone, borderRadius: 999, padding: '2px 8px', fontSize: 10, fontWeight: 600, cursor: blocked ? 'not-allowed' : 'pointer', opacity: blocked ? 0.6 : 1 }
                   }, shareLabel),
                   unread > 0 && e('span', { style: { background: 'var(--magenta)', color: '#fff', fontSize: 10, fontWeight: 700, borderRadius: 10, padding: '2px 7px', minWidth: 18, textAlign: 'center' } }, unread),
                 ),
@@ -1428,21 +1681,119 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
 
   // Chat window
   const peerInfo = peers.find(p => p.peerId === activeChatPeer) || { peerId: activeChatPeer, displayName: activeChatPeer };
+  const peerBlocked = !!peerInfo.blocked;
   const convMsgs = messages[activeChatPeer] || [];
 
   return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column' } },
+    confirmState && e('div', {
+      style: { position: 'fixed', inset: 0, zIndex: 1300, display: 'flex', alignItems: 'center', justifyContent: 'center' }
+    },
+      e('div', { onClick: () => setConfirmState(null), style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)' } }),
+      e('div', {
+        className: 'animate-bounce-in',
+        style: { position: 'relative', zIndex: 2, background: 'var(--bg-card)', borderRadius: 14, padding: 18, width: '90%', maxWidth: 360, border: '1px solid var(--border)' }
+      },
+        e('div', { style: { fontWeight: 700, fontSize: 16, marginBottom: 6, color: 'var(--text-primary)' } }, confirmState.title),
+        e('div', { style: { fontSize: 13, color: 'var(--text-secondary)', marginBottom: 14, lineHeight: 1.5 } }, confirmState.message),
+        e('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+          e('button', {
+            onClick: () => setConfirmState(null),
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 12px', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }
+          }, 'Cancel'),
+          e('button', {
+            onClick: () => { const action = confirmState.onConfirm; setConfirmState(null); if (action) action(); },
+            className: 'boost-btn',
+            style: { background: confirmState.danger ? 'var(--magenta)' : 'var(--accent)', border: '1px solid ' + (confirmState.danger ? 'var(--magenta)' : 'var(--accent)'), borderRadius: 8, padding: '8px 12px', color: 'var(--bg-deep)', fontSize: 12, cursor: 'pointer', fontWeight: 700 }
+          }, confirmState.confirmLabel || 'Confirm'),
+        ),
+      )
+    ),
+    showPeerMenu && e('div', {
+      onClick: () => setShowPeerMenu(false),
+      style: { position: 'fixed', inset: 0, zIndex: 1200 }
+    }),
     // Chat header
-    e('div', { style: { display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderBottom: '1px solid var(--border)', background: 'var(--glass-strong)', flexShrink: 0 } },
+    e('div', { style: { display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderBottom: '1px solid var(--border)', background: 'var(--glass-strong)', flexShrink: 0, position: 'relative', zIndex: 1201 } },
       e('button', {
         onClick: () => setActiveChatPeer(null),
         style: { background: 'none', border: 'none', color: 'var(--accent)', fontSize: 20, cursor: 'pointer', padding: 4 }
       }, '←'),
-      e('div', { style: { width: 36, height: 36, borderRadius: '50%', background: 'var(--bg-card2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, border: '2px solid ' + (peerInfo.connected ? 'var(--neon-green)' : 'var(--border)') } }, peerInfo.avatar || '👤'),
+      e('div', { style: { width: 36, height: 36, borderRadius: '50%', background: 'var(--bg-card2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, border: '2px solid ' + (peerInfo.connected ? 'var(--neon-green)' : 'var(--border)') } }, peerInfo.avatar || '🙂'),
       e('div', null,
         e('div', { style: { fontWeight: 600, fontSize: 14 } }, peerInfo.displayName),
-        e('div', { style: { fontSize: 10, color: peerInfo.connected ? 'var(--neon-green)' : 'var(--text-secondary)' } }, peerInfo.connected ? 'Online' : 'Offline'),
+        e('div', { style: { fontSize: 10, color: peerBlocked ? 'var(--magenta)' : peerInfo.connected ? 'var(--neon-green)' : 'var(--text-secondary)' } }, peerBlocked ? 'Blocked' : (peerInfo.connected ? 'Online' : 'Offline')),
+      ),
+      e('div', { style: { marginLeft: 'auto', position: 'relative' } },
+        e('button', {
+          onClick: () => setShowPeerMenu(v => !v),
+          className: 'boost-btn',
+          style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer', fontWeight: 600 }
+        }, 'More'),
+        showPeerMenu && e('div', {
+          style: {
+            position: 'absolute', right: 0, top: 'calc(100% + 6px)', minWidth: 180,
+            background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10,
+            padding: 6, boxShadow: '0 12px 30px rgba(0,0,0,0.25)', display: 'flex', flexDirection: 'column', gap: 4,
+          }
+        },
+          e('button', {
+            onClick: () => { setShowPeerMenu(false); buzzPeer(activeChatPeer); },
+            className: 'boost-btn',
+            disabled: peerBlocked,
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--amber)', fontSize: 11, cursor: peerBlocked ? 'not-allowed' : 'pointer', fontWeight: 600, opacity: peerBlocked ? 0.5 : 1, textAlign: 'left' }
+          }, 'Buzz'),
+          e('div', { style: { height: 1, background: 'var(--border)', margin: '4px 0' } }),
+          e('button', {
+            onClick: () => {
+              setShowPeerMenu(false);
+              setConfirmState({
+                title: 'Remove Peer',
+                message: 'Remove this peer from your list?',
+                confirmLabel: 'Remove',
+                danger: false,
+                onConfirm: () => { removePeer(activeChatPeer, false); setActiveChatPeer(null); },
+              });
+            },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer', textAlign: 'left' }
+          }, 'Remove'),
+          e('button', {
+            onClick: () => {
+              setShowPeerMenu(false);
+              setConfirmState({
+                title: 'Remove & Delete History',
+                message: 'Remove this peer and delete all chat history and shared blips from them?',
+                confirmLabel: 'Remove & Delete',
+                danger: true,
+                onConfirm: () => { removePeer(activeChatPeer, true); setActiveChatPeer(null); },
+              });
+            },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--magenta)', borderRadius: 8, padding: '8px 10px', color: 'var(--magenta)', fontSize: 11, cursor: 'pointer', fontWeight: 600, textAlign: 'left' }
+          }, 'Remove & Delete'),
+          e('button', {
+            onClick: () => {
+              setShowPeerMenu(false);
+              if (peerBlocked) {
+                blockPeer(activeChatPeer, false);
+                return;
+              }
+              setConfirmState({
+                title: 'Block Peer',
+                message: 'Block this peer? They will not reconnect automatically and cannot buzz or chat with you.',
+                confirmLabel: 'Block',
+                danger: true,
+                onConfirm: () => blockPeer(activeChatPeer, true),
+              });
+            },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--magenta)', fontSize: 11, cursor: 'pointer', textAlign: 'left' }
+          }, peerBlocked ? 'Unblock Peer' : 'Block Peer'),
+        ),
       ),
     ),
+
     // Messages
     e('div', { style: { flex: 1, overflow: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 6 } },
       convMsgs.length === 0 && e('div', { style: { textAlign: 'center', padding: 40, color: 'var(--text-secondary)', fontSize: 13 } }, 'No messages yet. Say hi! 👋'),
@@ -1465,13 +1816,15 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
       e('input', {
         value: chatInput, onChange: (ev) => setChatInput(ev.target.value),
         onKeyDown: (ev) => ev.key === 'Enter' && handleSend(),
-        placeholder: 'Type a message...',
-        style: { flex: 1, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 20, padding: '10px 16px', color: 'var(--text-primary)', fontSize: 14 }
+        placeholder: peerBlocked ? 'Peer is blocked' : 'Type a message...',
+        disabled: peerBlocked,
+        style: { flex: 1, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 20, padding: '10px 16px', color: 'var(--text-primary)', fontSize: 14, opacity: peerBlocked ? 0.6 : 1 }
       }),
       e('button', {
         onClick: handleSend,
         className: 'boost-btn',
-        style: { background: 'var(--accent)', color: 'var(--bg-deep)', border: 'none', borderRadius: '50%', width: 42, height: 42, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', fontSize: 18, fontWeight: 700 }
+        disabled: peerBlocked,
+        style: { background: 'var(--accent)', color: 'var(--bg-deep)', border: 'none', borderRadius: '50%', width: 42, height: 42, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: peerBlocked ? 'not-allowed' : 'pointer', fontSize: 18, fontWeight: 700, opacity: peerBlocked ? 0.6 : 1 }
       }, '⚡'),
     )
   );
@@ -1479,7 +1832,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
 
 // ========================== MAP VIEW ==========================
 
-function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPeer, settings, peers, categories }) {
+function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories }) {
   const mapContainerRef = useRef(null);
   const leafletMapRef = useRef(null);
   const userMarkerRef = useRef(null);
@@ -1766,8 +2119,12 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     setBlips(prev => prev.map(b => b.id === updated.id ? updated : b));
   }
 
-  function handleDeleteBlip(id) {
-    setBlips(prev => prev.filter(b => b.id !== id));
+  function handleDeleteBlip(blip) {
+    if (!blip) return;
+    setBlips(prev => prev.filter(b => b.id !== blip.id));
+    if (blip.creator === profile.peerId) {
+      sendReliableToAllPeers({ type: 'blip_delete', blipId: blip.id, creator: profile.peerId });
+    }
   }
 
   // Find selected blip data (fresh from state)
@@ -1798,6 +2155,10 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       onClose: () => setSelectedBlip(null),
       onUpdate: handleUpdateBlip,
       onDelete: handleDeleteBlip,
+      onRoute: (blip) => {
+        setRouteTarget({ lat: blip.lat, lng: blip.lng, label: blip.title });
+        setRouteActive(false);
+      },
       profile,
       sendToAllPeers,
       sendToPeer,
@@ -1861,7 +2222,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         borderRadius: '50%', background: 'var(--bg-card)', border: '1px solid var(--border)', color: 'var(--accent)',
         fontSize: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
       }
-    }, '◎'),
+    }, '⌖'),
 
     // Blip count badge
     e('div', {
@@ -1988,7 +2349,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         e('div', { style: { display: 'flex', gap: 16, marginBottom: 16 } },
           e('label', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text-secondary)', cursor: 'pointer' } },
             e('input', { type: 'checkbox', checked: newBlip.shareWithPeers, onChange: (ev) => setNewBlip(prev => ({ ...prev, shareWithPeers: ev.target.checked })) }),
-            '📡 Share with peers'
+            '🔗 Share with peers'
           ),
         ),
 
@@ -2014,13 +2375,13 @@ function GeochatView({ position, geochatMessages, setGeochatMessages, profile, s
   const [mood, setMood] = useState('');
   const feedEndRef = useRef(null);
 
-  const moods = ['😌 Calm', '😊 Happy', '😂 Funny', '🔥 Hype', '⚠️ Alert', '👀 Curious', '🎯 Focused', '💬 Social'];
+  const moods = ['🧘 Calm', '😊 Happy', '😂 Funny', '🔥 Hype', '🚨 Alert', '🤔 Curious', '🎯 Focused', '🫶 Social'];
 
   const zoneRadius = settings.geochat.zoneRadius || 1000;
   const zoneName = position ? getZoneName(position.lat, position.lng, zoneRadius) : 'Unknown Zone';
   const zoneKey = position ? getZoneKey(position.lat, position.lng, zoneRadius) : '';
 
-  // FIXED: More permissive filtering — show messages from same zone OR within radius
+  // FIXED: More permissive filtering - show messages from same zone OR within radius
   const filteredMessages = geochatMessages.filter(m => {
     // Always show own messages
     if (m.sender === (settings.geochat.anonymous ? 'Anon' : profile.displayName) || m.senderId === profile.peerId) return true;
@@ -2155,11 +2516,23 @@ function GeochatView({ position, geochatMessages, setGeochatMessages, profile, s
 
 // ========================== SETTINGS VIEW ==========================
 
-function SettingsView({ profile, setProfile, settings, setSettings, initPeer, blips, setBlips, setMessages, setGeochatMessages, setPeers, categories }) {
+function SettingsView({ profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, peers, setPeers, categories, runDailyBackup }) {
   const [section, setSection] = useState(null);
   const [showQR, setShowQR] = useState(false);
   const [newBlipType, setNewBlipType] = useState({ label: '', icon: '', color: 'var(--accent)' });
   const customBlipTypes = settings.customBlipTypes || [];
+  const colorOptions = [
+    { label: 'None (Use Theme Accent)', value: '' },
+    { label: 'Neon Green', value: '#39FF14' },
+    { label: 'Ocean Blue', value: '#4A90FF' },
+    { label: 'Cyan', value: '#00F0FF' },
+    { label: 'Amber', value: '#FFB800' },
+    { label: 'Magenta', value: '#FF2D78' },
+    { label: 'Purple', value: '#A855F7' },
+    { label: 'Orange', value: '#FF6B35' },
+    { label: 'Ruby Red', value: '#FF0000' },
+    { label: 'Slate', value: '#94A3B8' },
+  ];
 
   function updateSettings(path, value) {
     setSettings(prev => {
@@ -2187,6 +2560,73 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
     }
   }
 
+  async function chooseBackupFolder() {
+    if (!window.showDirectoryPicker) {
+      showToast('Folder access not supported', 'var(--magenta)');
+      return;
+    }
+    try {
+      const handle = await window.showDirectoryPicker();
+      await idbSet('backupDir', handle);
+      showToast('Backup folder set', 'var(--neon-green)');
+    } catch {}
+  }
+
+  async function registerPush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      showToast('Push not supported on this device', 'var(--magenta)');
+      return;
+    }
+    if (!settings.push.serverUrl || !settings.push.vapidPublicKey) {
+      showToast('Add server URL + VAPID key first', 'var(--amber)');
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      showToast('Notification permission denied', 'var(--magenta)');
+      return;
+    }
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(settings.push.vapidPublicKey),
+      });
+      const serverUrl = settings.push.serverUrl.replace(/\/$/, '');
+      await fetch(serverUrl + '/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ peerId: profile.peerId, subscription: sub }),
+      });
+      showToast('Push enabled', 'var(--neon-green)');
+    } catch {
+      showToast('Push registration failed', 'var(--magenta)');
+    }
+  }
+
+  async function unregisterPush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      showToast('Push not supported on this device', 'var(--magenta)');
+      return;
+    }
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) await sub.unsubscribe();
+      if (settings.push.serverUrl) {
+        const serverUrl = settings.push.serverUrl.replace(/\/$/, '');
+        await fetch(serverUrl + '/unsubscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ peerId: profile.peerId }),
+        });
+      }
+      showToast('Push disabled', 'var(--amber)');
+    } catch {
+      showToast('Push unregister failed', 'var(--magenta)');
+    }
+  }
+
   const sectionStyle = { background: 'var(--bg-card)', borderRadius: 12, padding: '16px', marginBottom: 12, border: '1px solid var(--border)' };
   const labelStyle = { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6, fontWeight: 500, textTransform: 'uppercase', letterSpacing: 1 };
   const inputStyle = { width: '100%', background: 'var(--bg-deep)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 12px', color: 'var(--text-primary)', fontSize: 13, marginBottom: 10 };
@@ -2204,7 +2644,7 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         ),
       ),
       e('div', { style: { display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 12 } },
-        ['⚡', '🔥', '💀', '👾', '🎮', '🌙', '🚀', '💎', '🎯', '🐉', '🦊', '🤖'].map(av => e('button', {
+        ['⚡', '🔥', '💀', '👾', '🎮', '🌙', '🚀', '💎', '🎯', '🐉', '🦊', '🤖', '😎', '😊', '🧠', '🦉', '🐯', '🐼', '🦈', '🦁', '🦄'].map(av => e('button', {
           key: av, onClick: () => setProfile(p => ({ ...p, avatar: av })),
           style: { fontSize: 22, padding: '4px 8px', background: profile.avatar === av ? 'var(--bg-card2)' : 'transparent', border: profile.avatar === av ? '1px solid var(--accent)' : '1px solid transparent', borderRadius: 8, cursor: 'pointer' }
         }, av))
@@ -2214,9 +2654,9 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         e('div', { style: { ...labelStyle, marginBottom: 8 } }, 'SHARE YOUR ID'),
         !showQR
           ? e('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
-              e('button', { onClick: () => setShowQR(true), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: '#A855F7', fontSize: 12, cursor: 'pointer' } }, '📱 Show QR'),
+              e('button', { onClick: () => setShowQR(true), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: '#A855F7', fontSize: 12, cursor: 'pointer' } }, '📷 Show QR'),
               e('button', { onClick: () => handleShareVia('copy'), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: 'var(--accent)', fontSize: 12, cursor: 'pointer' } }, '📋 Copy ID'),
-              navigator.share && e('button', { onClick: () => handleShareVia('native'), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer' } }, '📤 Share'),
+              navigator.share && e('button', { onClick: () => handleShareVia('native'), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer' } }, '🔗 Share'),
             )
           : e('div', { style: { textAlign: 'center' } },
               e('div', { style: { background: '#fff', borderRadius: 12, padding: 12, display: 'inline-block', marginBottom: 8 } },
@@ -2284,12 +2724,13 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         }),
       ),
       e('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 } },
-        e('input', {
-          value: newBlipType.color,
+        e('select', {
+          value: newBlipType.color || '',
           onChange: (ev) => setNewBlipType(prev => ({ ...prev, color: ev.target.value })),
-          placeholder: 'var(--accent)',
           style: { ...inputStyle, marginBottom: 0 }
-        }),
+        },
+          colorOptions.map(opt => e('option', { key: opt.label, value: opt.value }, opt.label))
+        ),
         e('button', {
           onClick: () => {
             const label = newBlipType.label.trim();
@@ -2310,7 +2751,7 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
 
     // PeerJS Server
     e('div', { style: sectionStyle },
-      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, '🌐 PeerJS Server'),
+      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, '🛰️ PeerJS Server'),
       e('div', { style: toggleRowStyle },
         e('span', { style: { fontSize: 13, color: 'var(--text-primary)' } }, 'Use Default Cloud'),
         e('input', {
@@ -2342,7 +2783,46 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         onClick: () => { initPeer(); showToast('Reconnecting...', 'var(--amber)'); },
         className: 'boost-btn',
         style: { width: '100%', padding: '10px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontWeight: 600, fontSize: 13, cursor: 'pointer', marginTop: 8 }
-      }, '🔄 Reconnect'),
+      }, '⚡ Reconnect'),
+    ),
+
+    // Push Notifications
+    e('div', { style: sectionStyle },
+      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, 'Push Notifications'),
+      e('div', { style: toggleRowStyle },
+        e('span', { style: { fontSize: 13, color: 'var(--text-primary)' } }, 'Enable Push for Buzz'),
+        e('input', {
+          type: 'checkbox', checked: !!(settings.push && settings.push.enabled),
+          onChange: (ev) => updateSettings('push.enabled', ev.target.checked),
+        }),
+      ),
+      e('div', { style: labelStyle }, 'RELAY SERVER URL'),
+      e('input', {
+        value: (settings.push && settings.push.serverUrl) || '',
+        onChange: (ev) => updateSettings('push.serverUrl', ev.target.value),
+        placeholder: 'https://your-relay.example.com',
+        style: inputStyle,
+      }),
+      e('div', { style: labelStyle }, 'VAPID PUBLIC KEY'),
+      e('input', {
+        value: (settings.push && settings.push.vapidPublicKey) || '',
+        onChange: (ev) => updateSettings('push.vapidPublicKey', ev.target.value),
+        placeholder: 'BOPd...your key...',
+        style: inputStyle,
+      }),
+      e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+        e('button', {
+          onClick: registerPush,
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Register Device'),
+        e('button', {
+          onClick: unregisterPush,
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--amber)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Unregister'),
+      ),
+      e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'Optional relay for buzz when peers are offline.'),
     ),
 
     // ICE Servers
@@ -2437,6 +2917,127 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
       e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
         e('button', {
           onClick: () => {
+            const data = JSON.stringify({
+              version: 1,
+              profile: { displayName: profile.displayName, avatar: profile.avatar, createdAt: profile.createdAt },
+              settings,
+              peers,
+              messages,
+              blips,
+              geochatMessages,
+            }, null, 2);
+            const blob = new Blob([data], { type: 'application/json' });
+            if (navigator.msSaveOrOpenBlob) {
+              navigator.msSaveOrOpenBlob(blob, 'boost-backup.json');
+              showToast('Backup exported', 'var(--neon-green)');
+              return;
+            }
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'boost-backup.json';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+            showToast('Backup exported', 'var(--neon-green)');
+          },
+          className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Export All'),
+        e('button', {
+          onClick: () => {
+            const input = document.createElement('input');
+            input.type = 'file'; input.accept = '.json';
+            input.onchange = (ev) => {
+              const file = ev.target.files[0];
+              if (!file) return;
+              const reader = new FileReader();
+              reader.onload = (e) => {
+                try {
+                  const imported = JSON.parse(e.target.result);
+                  if (!imported || typeof imported !== 'object') throw new Error('Invalid');
+                  if (!confirm('Import backup and merge data?')) return;
+                  if (imported.profile) {
+                    setProfile(p => ({
+                      ...p,
+                      displayName: imported.profile.displayName || p.displayName,
+                      avatar: imported.profile.avatar || p.avatar,
+                      createdAt: imported.profile.createdAt || p.createdAt,
+                    }));
+                  }
+                  if (imported.settings) {
+                    setSettings(prev => ({
+                      ...prev,
+                      ...imported.settings,
+                      peerServer: { ...DEFAULT_SETTINGS.peerServer, ...(imported.settings.peerServer || {}) },
+                      iceServers: { ...DEFAULT_SETTINGS.iceServers, ...(imported.settings.iceServers || {}) },
+                      geochat: { ...DEFAULT_SETTINGS.geochat, ...(imported.settings.geochat || {}) },
+                      map: { ...DEFAULT_SETTINGS.map, ...(imported.settings.map || {}) },
+                      ui: { ...DEFAULT_SETTINGS.ui, ...(imported.settings.ui || {}) },
+                      push: { ...DEFAULT_SETTINGS.push, ...(imported.settings.push || {}) },
+                      customBlipTypes: imported.settings.customBlipTypes || prev.customBlipTypes || [],
+                    }));
+                  }
+                  if (Array.isArray(imported.peers)) {
+                    setPeers(prev => {
+                      const map = new Map(prev.map(p => [p.peerId, p]));
+                      imported.peers.forEach(p => {
+                        if (!p || !p.peerId) return;
+                        map.set(p.peerId, { ...(map.get(p.peerId) || {}), ...p });
+                      });
+                      return Array.from(map.values());
+                    });
+                  }
+                  if (Array.isArray(imported.blips)) {
+                    setBlips(prev => {
+                      const map = new Map(prev.map(b => [b.id, b]));
+                      imported.blips.forEach(b => {
+                        if (!b || !b.id) return;
+                        map.set(b.id, map.get(b.id) || b);
+                      });
+                      return Array.from(map.values());
+                    });
+                  }
+                  if (imported.messages && typeof imported.messages === 'object') {
+                    setMessages(prev => {
+                      const next = { ...prev };
+                      Object.keys(imported.messages).forEach(pid => {
+                        const prevMsgs = next[pid] || [];
+                        const incoming = imported.messages[pid] || [];
+                        const seen = new Set(prevMsgs.map(m => m.id));
+                        const merged = [...prevMsgs];
+                        incoming.forEach(m => {
+                          if (!m || !m.id) return;
+                          if (!seen.has(m.id)) {
+                            seen.add(m.id);
+                            merged.push(m);
+                          }
+                        });
+                        next[pid] = merged;
+                      });
+                      return next;
+                    });
+                  }
+                  if (Array.isArray(imported.geochatMessages)) {
+                    setGeochatMessages(prev => {
+                      const map = new Map(prev.map(m => [m.id, m]));
+                      imported.geochatMessages.forEach(m => {
+                        if (!m || !m.id) return;
+                        map.set(m.id, map.get(m.id) || m);
+                      });
+                      return Array.from(map.values());
+                    });
+                  }
+                  showToast('Backup imported', 'var(--neon-green)');
+                } catch { showToast('Invalid backup file', 'var(--magenta)'); }
+              };
+              reader.readAsText(file);
+            };
+            input.click();
+          },
+          className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--amber)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Import All'),
+        e('button', {
+          onClick: () => {
             const data = JSON.stringify(blips, null, 2);
             const blob = new Blob([data], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
@@ -2445,7 +3046,7 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
             showToast('Blips exported!', 'var(--neon-green)');
           },
           className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
-        }, '📤 Export Blips'),
+        }, '⬇️ Export Blips'),
         e('button', {
           onClick: () => {
             const input = document.createElement('input');
@@ -2468,7 +3069,7 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
             input.click();
           },
           className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--amber)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
-        }, '📥 Import Blips'),
+        }, '⬆️ Import Blips'),
         e('button', {
           onClick: () => {
             if (confirm('Clear ALL data? This cannot be undone.')) {
@@ -2477,14 +3078,14 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
             }
           },
           className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--magenta)', color: 'var(--magenta)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
-        }, '🗑️ Clear All Data'),
+        }, '🧹 Clear All Data'),
       ),
     ),
 
     // About
     e('div', { style: { ...sectionStyle, textAlign: 'center' } },
       e('div', { style: { fontSize: 24, fontWeight: 700, color: 'var(--accent)', letterSpacing: 4, marginBottom: 4 } }, '⚡ BOOST'),
-      e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 } }, 'v1.1.0 — P2P Social Map & Chat'),
+      e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 } }, 'v1.1.0 - P2P Social Map & Chat'),
       e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 } }, 'Built with PeerJS, Leaflet, React'),
       e('a', { href: 'https://fractal.co.ke', style: { fontSize: 12, color: 'var(--accent)', textDecoration: 'none' } }, 'Powered by Fractal'),
     ),
@@ -2499,6 +3100,22 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(e(App));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
