@@ -910,6 +910,7 @@ function App() {
   const connectionsRef = useRef({});
   const peerHealthRef = useRef({});
   const peersRef = useRef([]);
+  const blipsRef = useRef([]);
   const postsRef = useRef([]);
   const geoPostsRef = useRef([]);
   const peerKeysRef = useRef({});
@@ -939,6 +940,7 @@ function App() {
   const allCategories = useMemo(() => getAllCategories(settings.customBlipTypes), [settings.customBlipTypes]);
   useEffect(() => { saveStorage(peersKey, peers); }, [peers]);
   useEffect(() => { peersRef.current = peers; }, [peers]);
+  useEffect(() => { blipsRef.current = blips; }, [blips]);
   useEffect(() => {
     const t = setTimeout(() => saveStorage(messagesKey, messages), 600);
     return () => clearTimeout(t);
@@ -1272,6 +1274,11 @@ function App() {
     updatePeer(peerId, { muted: !!muted });
   }
 
+  function togglePeerBlips(peerId, visible) {
+    if (!peerId) return;
+    updatePeer(peerId, { blipsVisible: !!visible });
+  }
+
   function handleConnection(conn) {
     const peerId = conn.peer;
     if (isPeerBlocked(peerId)) {
@@ -1299,8 +1306,10 @@ function App() {
       // Sync existing blips to new peer
       const myBlips = blips.filter(b => !b.isRemote);
       myBlips.forEach(b => {
-        conn.send({ type: 'blip', blip: b });
+        sendToPeer(peerId, { type: 'blip', blip: b });
       });
+      // Request their existing blips
+      conn.send({ type: 'blip_sync_req' });
       // Sync recent posts to new peer
       const now = Date.now();
       const recentPosts = (postsRef.current || []).filter(p => p.senderId === profile.peerId && (p.feed !== 'geofeed') && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
@@ -1456,6 +1465,14 @@ function App() {
           });
           showToast('New blip from ' + (data.blip.creatorName || 'peer'), 'var(--neon-green)');
           logActivity({ type: 'blip', title: data.blip.title || 'Blip', peerId: fromPeer });
+        }
+        break;
+      case 'blip_sync_req':
+        {
+          const myBlips = blipsRef.current.filter(b => !b.isRemote);
+          myBlips.forEach(b => {
+            sendToPeer(fromPeer, { type: 'blip', blip: b });
+          });
         }
         break;
       case 'blip_update':
@@ -1922,7 +1939,7 @@ function App() {
           style: { background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 999, padding: '4px 10px', fontSize: 11, cursor: 'pointer', fontWeight: 700 }
         }, 'Refresh')
       ),
-      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories: allCategories, setActiveTab }),
+      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories: allCategories, setActiveTab, togglePeerBlips }),
       activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories: allCategories, logActivity }),
       activeTab === 'feed' && e(FeedView, { position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings, feedFocus, setFeedFocus, hiddenPosts, setHiddenPosts, mutedPeerIds, toggleMutePeer }),
       activeTab === 'geochat' && e(GeochatView, { position, geochatMessages, setGeochatMessages, profile, sendToAllPeers, settings }),
@@ -2035,7 +2052,7 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts, activityUnread }) {
 
 // ========================== CHAT VIEW ==========================
 
-function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories, setActiveTab }) {
+function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories, setActiveTab, togglePeerBlips }) {
   const [connectInput, setConnectInput] = useState('');
   const [showConnect, setShowConnect] = useState(false);
   const [showQR, setShowQR] = useState(false);
@@ -2266,6 +2283,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
   // Chat window
   const peerInfo = peers.find(p => p.peerId === activeChatPeer) || { peerId: activeChatPeer, displayName: activeChatPeer };
   const peerBlocked = !!peerInfo.blocked;
+  const peerBlipsVisible = peerInfo.blipsVisible !== false;
   const convMsgs = messages[activeChatPeer] || [];
 
   return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column' } },
@@ -2349,6 +2367,14 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
             className: 'boost-btn',
             style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--accent)', fontSize: 11, cursor: 'pointer', textAlign: 'left' }
           }, 'Open on Map'),
+          e('button', {
+            onClick: () => {
+              setShowPeerMenu(false);
+              if (togglePeerBlips) togglePeerBlips(activeChatPeer, !peerBlipsVisible);
+            },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer', textAlign: 'left' }
+          }, peerBlipsVisible ? 'Hide Blips' : 'Show Blips'),
           e('div', { style: { height: 1, background: 'var(--border)', margin: '4px 0' } }),
           e('button', {
             onClick: () => {
@@ -3120,6 +3146,16 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const [blipListLimit, setBlipListLimit] = useState(8);
   const [tileError, setTileError] = useState(false);
   const [routeError, setRouteError] = useState(false);
+  const hiddenPeerBlips = useMemo(() => {
+    return new Set((peers || []).filter(p => p.blipsVisible === false).map(p => p.peerId));
+  }, [peers]);
+  const isBlipVisible = (blip) => {
+    if (!blip) return false;
+    if (!blip.isRemote) return true;
+    const creator = blip.creator || blip.creatorId || blip.senderId;
+    if (!creator) return true;
+    return !hiddenPeerBlips.has(creator);
+  };
   const allCategories = categories && categories.length ? categories : BLIP_CATEGORIES;
 
   function buildAltRoute(start, end) {
@@ -3286,7 +3322,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     const layer = blipLayerRef.current;
     const markers = blipMarkersRef.current;
     const hidden = settings.map.hiddenCategories || [];
-    const visible = blips.filter(b => !hidden.includes(b.type));
+    const visible = blips.filter(b => !hidden.includes(b.type)).filter(isBlipVisible);
     const activeIds = new Set();
 
     visible.forEach(blip => {
@@ -3334,7 +3370,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         delete markers[id];
       }
     });
-  }, [blips, settings.map.hiddenCategories]);
+  }, [blips, settings.map.hiddenCategories, hiddenPeerBlips]);
 
   useEffect(() => {
     if (!peerLayerRef.current) return;
@@ -3494,7 +3530,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   // Find selected blip data (fresh from state)
   const selectedBlipData = selectedBlip ? blips.find(b => b.id === selectedBlip) : null;
   const hiddenCategories = settings.map.hiddenCategories || [];
-  const visibleBlips = blips.filter(b => !hiddenCategories.includes(b.type));
+  const visibleBlips = blips.filter(b => !hiddenCategories.includes(b.type)).filter(isBlipVisible);
   const sharePeers = peers.filter(p => p.shareActive && p.lastLoc);
   useEffect(() => {
     window.__boost_open_route = (target) => {
