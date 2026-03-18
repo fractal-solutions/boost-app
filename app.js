@@ -25,6 +25,17 @@ function timeAgo(ts) {
   return Math.floor(diff / 86400000) + 'd ago';
 }
 
+function buildReactionCounts(reactionsBy) {
+  const counts = {};
+  if (!reactionsBy) return counts;
+  Object.keys(reactionsBy).forEach(pid => {
+    const rx = reactionsBy[pid];
+    if (!rx) return;
+    counts[rx] = (counts[rx] || 0) + 1;
+  });
+  return counts;
+}
+
 function distanceStr(d) {
   if (d < 1000) return Math.round(d) + 'm away';
   return (d / 1000).toFixed(1) + 'km away';
@@ -836,11 +847,17 @@ function App() {
   const [activity, setActivity] = useState(() => loadStorageWithMigration(deviceId, 'activity', []));
   const [posts, setPosts] = useState(() => {
     const stored = loadStorageWithMigration(deviceId, 'posts', []);
-    return stored.filter(p => !p.expiresAt || p.expiresAt > Date.now());
+    return stored
+      .map(p => ({ ...p, feed: p.feed || 'peers' }))
+      .filter(p => p.feed !== 'geofeed')
+      .filter(p => !p.expiresAt || p.expiresAt > Date.now());
   });
   const [geoPosts, setGeoPosts] = useState(() => {
     const stored = loadStorageWithMigration(deviceId, 'geo_posts', []);
-    return stored.filter(p => !p.expiresAt || p.expiresAt > Date.now());
+    return stored
+      .map(p => ({ ...p, feed: p.feed || 'geofeed' }))
+      .filter(p => p.feed === 'geofeed')
+      .filter(p => !p.expiresAt || p.expiresAt > Date.now());
   });
   const [lastBackupAt, setLastBackupAt] = useState(() => loadStorage('boost_last_backup_at', 0));
   const [position, setPosition] = useState(null);
@@ -849,6 +866,8 @@ function App() {
   const [unreadCounts, setUnreadCounts] = useState({});
   const [outbox, setOutbox] = useState(() => loadStorageWithMigration(deviceId, 'outbox', []));
   const [networkOnline, setNetworkOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+  const [feedFocus, setFeedFocus] = useState(null);
+  const [activityUnread, setActivityUnread] = useState(0);
 
   const peerRef = useRef(null);
   const connectionsRef = useRef({});
@@ -1028,6 +1047,9 @@ function App() {
       const next = [{ id: generateId('act'), ts: Date.now(), ...entry }, ...prev];
       return next.slice(0, ACTIVITY_MAX);
     });
+    if (activeTab !== 'activity') {
+      setActivityUnread(prev => prev + 1);
+    }
   }
 
   async function deriveSharedKey(peerId, peerPubJwk) {
@@ -1122,9 +1144,9 @@ function App() {
       });
       // Sync recent posts to new peer
       const now = Date.now();
-      const recentPosts = (postsRef.current || []).filter(p => p.senderId === profile.peerId && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      const recentPosts = (postsRef.current || []).filter(p => p.senderId === profile.peerId && (p.feed !== 'geofeed') && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
       recentPosts.forEach(p => { sendToPeer(peerId, { type: 'post', post: p }); });
-      const recentGeo = (geoPostsRef.current || []).filter(p => p.senderId === profile.peerId && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      const recentGeo = (geoPostsRef.current || []).filter(p => p.senderId === profile.peerId && (p.feed === 'geofeed' || !p.feed) && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
       recentGeo.forEach(p => { sendToPeer(peerId, { type: 'geofeed_post', post: p }); });
       flushOutbox(peerId);
     });
@@ -1303,23 +1325,54 @@ function App() {
         break;
       case 'post':
         if (data.post && (!data.post.expiresAt || data.post.expiresAt > Date.now())) {
-          setPosts(prev => [data.post, ...prev].slice(0, 200));
+          const incoming = { ...data.post, feed: data.post.feed || 'peers' };
+          setPosts(prev => {
+            if (prev.find(p => p.id === incoming.id)) return prev;
+            return [incoming, ...prev].slice(0, 200);
+          });
+          logActivity({ type: 'feed_post', title: data.post.text || 'New post', peerId: fromPeer, action: { tab: 'feed', mode: 'peers', postId: data.post.id } });
         }
         break;
       case 'geofeed_post':
         if (data.post && (!data.post.expiresAt || data.post.expiresAt > Date.now())) {
-          setGeoPosts(prev => [data.post, ...prev].slice(0, 200));
+          const incoming = { ...data.post, feed: data.post.feed || 'geofeed' };
+          setGeoPosts(prev => {
+            if (prev.find(p => p.id === incoming.id)) return prev;
+            return [incoming, ...prev].slice(0, 200);
+          });
         }
         break;
       case 'post_reaction':
         if (data.postId && data.reaction) {
+          const senderId = data.senderId || fromPeer;
           const updater = (p) => {
-            const reactions = { ...(p.reactions || {}) };
-            reactions[data.reaction] = (reactions[data.reaction] || 0) + 1;
-            return { ...p, reactions };
+            const reactionsBy = { ...(p.reactionsBy || {}) };
+            const prev = reactionsBy[senderId];
+            if (prev === data.reaction) {
+              delete reactionsBy[senderId];
+            } else {
+              reactionsBy[senderId] = data.reaction;
+            }
+            return { ...p, reactionsBy, reactions: buildReactionCounts(reactionsBy) };
           };
           if (data.feed === 'geofeed') updatePostById(setGeoPosts, data.postId, updater);
           else updatePostById(setPosts, data.postId, updater);
+          if (senderId === profile.peerId) break;
+          if (data.feed !== 'geofeed') {
+            const post = (postsRef.current || []).find(p => p.id === data.postId);
+            const isMine = post && post.senderId === profile.peerId;
+            const iReplied = post && (post.replies || []).some(r => r.senderId === profile.peerId);
+            if (isMine || iReplied) {
+              logActivity({ type: 'feed_reaction', title: data.reaction, peerId: fromPeer, action: { tab: 'feed', mode: data.feed || 'peers', postId: data.postId, openReplies: true } });
+            }
+          } else {
+            const post = (geoPostsRef.current || []).find(p => p.id === data.postId);
+            const isMine = post && post.senderId === profile.peerId;
+            const iReplied = post && (post.replies || []).some(r => r.senderId === profile.peerId);
+            if (isMine || iReplied) {
+              logActivity({ type: 'feed_reaction', title: data.reaction, peerId: fromPeer, action: { tab: 'feed', mode: 'geofeed', postId: data.postId, openReplies: true } });
+            }
+          }
         }
         break;
       case 'post_reply':
@@ -1331,6 +1384,21 @@ function App() {
           };
           if (data.feed === 'geofeed') updatePostById(setGeoPosts, data.postId, updater);
           else updatePostById(setPosts, data.postId, updater);
+          if (data.feed !== 'geofeed') {
+            const post = (postsRef.current || []).find(p => p.id === data.postId);
+            const isMine = post && post.senderId === profile.peerId;
+            const iReplied = post && (post.replies || []).some(r => r.senderId === profile.peerId);
+            if (isMine || iReplied) {
+              logActivity({ type: 'feed_reply', title: data.reply.text || 'Reply', peerId: fromPeer, action: { tab: 'feed', mode: data.feed || 'peers', postId: data.postId, openReplies: true } });
+            }
+          } else {
+            const post = (geoPostsRef.current || []).find(p => p.id === data.postId);
+            const isMine = post && post.senderId === profile.peerId;
+            const iReplied = post && (post.replies || []).some(r => r.senderId === profile.peerId);
+            if (isMine || iReplied) {
+              logActivity({ type: 'feed_reply', title: data.reply.text || 'Reply', peerId: fromPeer, action: { tab: 'feed', mode: 'geofeed', postId: data.postId, openReplies: true } });
+            }
+          }
         }
         break;
       case 'ping':
@@ -1626,13 +1694,17 @@ function App() {
     e('div', { style: { flex: 1, overflow: 'hidden', position: 'relative' } },
       activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
       activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories: allCategories, logActivity }),
-      activeTab === 'feed' && e(FeedView, { position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings }),
+      activeTab === 'feed' && e(FeedView, { position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings, feedFocus, setFeedFocus }),
       activeTab === 'geochat' && e(GeochatView, { position, geochatMessages, setGeochatMessages, profile, sendToAllPeers, settings }),
-      activeTab === 'activity' && e(ActivityView, { activity, peers }),
+      activeTab === 'activity' && e(ActivityView, { activity, peers, onOpenActivity: (action) => {
+        if (!action) return;
+        if (action.tab) setActiveTab(action.tab);
+        if (action.tab === 'feed') setFeedFocus(action);
+      }}),
       activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, peers, setPeers, categories: allCategories, runDailyBackup }),
     ),
     // Bottom nav
-    e(BottomNav, { activeTab, setActiveTab, unreadCounts })
+    e(BottomNav, { activeTab, setActiveTab, unreadCounts, activityUnread })
   );
 }
 
@@ -1683,7 +1755,7 @@ function Header({ profile, connectionStatus, connectedPeersCount, onReconnect })
 
 // ========================== BOTTOM NAV ==========================
 
-function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
+function BottomNav({ activeTab, setActiveTab, unreadCounts, activityUnread }) {
   const tabs = [
     { id: 'chat', label: 'Chat' },
     { id: 'map', label: 'Map' },
@@ -1717,6 +1789,12 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
           fontSize: 9, fontWeight: 700, borderRadius: 10, padding: '1px 5px', minWidth: 16, textAlign: 'center',
         }
       }, totalUnread > 9 ? '9+' : totalUnread),
+      tab.id === 'activity' && activityUnread > 0 && e('span', {
+        style: {
+          position: 'absolute', top: 6, right: 16, background: 'var(--amber)', color: '#fff',
+          fontSize: 9, fontWeight: 700, borderRadius: 10, padding: '1px 5px', minWidth: 16, textAlign: 'center',
+        }
+      }, activityUnread > 9 ? '9+' : activityUnread),
       e('span', { style: { fontSize: 11, fontWeight: 600, color: activeTab === tab.id ? 'var(--accent)' : 'var(--text-secondary)', letterSpacing: 0.4 } }, tab.label),
       activeTab === tab.id && e('div', { className: 'tab-indicator' }),
     ))
@@ -1749,6 +1827,12 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
     setShowPeerMenu(false);
     setConfirmState(null);
   }, [activeChatPeer]);
+
+  useEffect(() => {
+    if (activeTab === 'activity') {
+      setActivityUnread(0);
+    }
+  }, [activeTab]);
 
   function handleConnect() {
     const id = connectInput.trim();
@@ -2122,7 +2206,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
 
 // ========================== ACTIVITY VIEW ==========================
 
-function ActivityView({ activity, peers }) {
+function ActivityView({ activity, peers, onOpenActivity }) {
   const peerMap = useMemo(() => {
     const map = {};
     (peers || []).forEach(p => { map[p.peerId] = p.displayName || p.peerId; });
@@ -2138,6 +2222,9 @@ function ActivityView({ activity, peers }) {
       case 'comment': return 'Comment from ' + peerName;
       case 'buzz': return 'Buzz from ' + peerName;
       case 'connect': return 'Connected to ' + peerName;
+      case 'feed_post': return 'Post from ' + peerName;
+      case 'feed_reply': return 'Reply from ' + peerName;
+      case 'feed_reaction': return 'Reaction from ' + peerName;
       default: return 'Activity';
     }
   };
@@ -2155,6 +2242,12 @@ function ActivityView({ activity, peers }) {
         return '🔔';
       case 'connect':
         return '🤝';
+      case 'feed_post':
+        return '📰';
+      case 'feed_reply':
+        return '💬';
+      case 'feed_reaction':
+        return '✨';
       default:
         return '✨';
     }
@@ -2167,9 +2260,10 @@ function ActivityView({ activity, peers }) {
     ),
     activity.map(item => e('div', {
       key: item.id,
+      onClick: () => { if (item.action && onOpenActivity) onOpenActivity(item.action); },
       style: {
         background: 'var(--bg-card)', borderRadius: 12, padding: '12px 14px', marginBottom: 8,
-        border: '1px solid var(--border)', boxShadow: 'var(--shadow-soft)'
+        border: '1px solid var(--border)', boxShadow: 'var(--shadow-soft)', cursor: item.action ? 'pointer' : 'default'
       }
     },
       e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
@@ -2184,7 +2278,7 @@ function ActivityView({ activity, peers }) {
 
 // ========================== FEED VIEW ==========================
 
-function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings }) {
+function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings, feedFocus, setFeedFocus }) {
   const [mode, setMode] = useState('peers');
   const [text, setText] = useState('');
   const [imageData, setImageData] = useState('');
@@ -2194,6 +2288,9 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
   const [expiryMs, setExpiryMs] = useState(48 * 60 * 60 * 1000);
   const [openReplies, setOpenReplies] = useState({});
   const [replyDrafts, setReplyDrafts] = useState({});
+  const postRefs = useRef({});
+  const draftKey = 'boost_feed_draft_' + (mode || 'peers');
+  const hasDraft = !!((text && text.trim()) || imageData);
   const MAX_LEN = 280;
   const MAX_IMAGE_BYTES = 1500 * 1024;
   const zoneRadius = settings.geochat.zoneRadius || 1000;
@@ -2202,11 +2299,16 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
   const peersSet = useMemo(() => new Set((peers || []).map(p => p.peerId)), [peers]);
 
   const filteredPeersFeed = useMemo(() => {
-    return (posts || []).filter(p => p.senderId === profile.peerId || peersSet.has(p.senderId));
+    return (posts || []).filter(p => (p.feed !== 'geofeed') && (p.senderId === profile.peerId || peersSet.has(p.senderId)));
   }, [posts, peersSet, profile.peerId]);
+
+  const filteredMineFeed = useMemo(() => {
+    return (posts || []).filter(p => (p.feed !== 'geofeed') && p.senderId === profile.peerId);
+  }, [posts, profile.peerId]);
 
   const filteredGeoFeed = useMemo(() => {
     return (geoPosts || []).filter(p => {
+      if (p.feed && p.feed !== 'geofeed') return false;
       if (p.senderId === profile.peerId) return true;
       if (!settings.geochat.enabled) return false;
       if (!zoneKey) return false;
@@ -2238,6 +2340,13 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
     setImageName('');
   }
 
+  function closeComposer() {
+    setShowComposer(false);
+    if ((text && text.trim()) || imageData) {
+      showToast('Draft saved', 'var(--neon-green)');
+    }
+  }
+
   function handlePost() {
     if (posting) return;
     const cleanText = text.trim();
@@ -2265,6 +2374,7 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
       imageName: imageName || null,
       timestamp: Date.now(),
       expiresAt: expiryMs === 0 ? null : Date.now() + expiryMs,
+      feed: mode === 'geofeed' ? 'geofeed' : 'peers',
       lat: position ? position.lat : null,
       lng: position ? position.lng : null,
       zoneKey: position ? getZoneKey(position.lat, position.lng, zoneRadius) : null,
@@ -2282,24 +2392,32 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
     setText('');
     clearImage();
     setShowComposer(false);
+    try { localStorage.removeItem(draftKey); } catch {}
     setPosting(false);
   }
 
-  function addReaction(postId, reaction) {
+  function addReaction(postId, reaction, feedType) {
     if (!postId || !reaction) return;
+    const targetFeed = feedType || (mode === 'geofeed' ? 'geofeed' : 'peers');
     const updater = (p) => {
-      const reactions = { ...(p.reactions || {}) };
-      reactions[reaction] = (reactions[reaction] || 0) + 1;
-      return { ...p, reactions };
+      const reactionsBy = { ...(p.reactionsBy || {}) };
+      const prev = reactionsBy[profile.peerId];
+      if (prev === reaction) {
+        delete reactionsBy[profile.peerId];
+      } else {
+        reactionsBy[profile.peerId] = reaction;
+      }
+      return { ...p, reactionsBy, reactions: buildReactionCounts(reactionsBy) };
     };
-    if (mode === 'geofeed') setGeoPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    if (targetFeed === 'geofeed') setGeoPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
     else setPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
-    sendReliableToAllPeers({ type: 'post_reaction', feed: mode, postId, reaction });
+    sendReliableToAllPeers({ type: 'post_reaction', feed: targetFeed, postId, reaction, senderId: profile.peerId, senderName: profile.displayName });
   }
 
-  function addReply(postId) {
+  function addReply(postId, feedType) {
     const text = (replyDrafts[postId] || '').trim();
     if (!text) return;
+    const targetFeed = feedType || (mode === 'geofeed' ? 'geofeed' : 'peers');
     const reply = {
       id: generateId('reply'),
       senderId: profile.peerId,
@@ -2311,14 +2429,45 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
       const replies = p.replies || [];
       return { ...p, replies: [...replies, reply] };
     };
-    if (mode === 'geofeed') setGeoPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    if (targetFeed === 'geofeed') setGeoPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
     else setPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
-    sendReliableToAllPeers({ type: 'post_reply', feed: mode, postId, reply });
+    sendReliableToAllPeers({ type: 'post_reply', feed: targetFeed, postId, reply });
     setReplyDrafts(prev => ({ ...prev, [postId]: '' }));
     setOpenReplies(prev => ({ ...prev, [postId]: true }));
   }
 
-  const feedItems = (mode === 'geofeed' ? filteredGeoFeed : filteredPeersFeed).filter(p => !p.expiresAt || p.expiresAt > Date.now());
+  const feedItems = (mode === 'geofeed' ? filteredGeoFeed : mode === 'mine' ? filteredMineFeed : filteredPeersFeed)
+    .filter(p => !p.expiresAt || p.expiresAt > Date.now());
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(draftKey) || 'null');
+      if (saved && typeof saved === 'object') {
+        if (typeof saved.text === 'string') setText(saved.text);
+        if (typeof saved.imageData === 'string') setImageData(saved.imageData);
+        if (typeof saved.imageName === 'string') setImageName(saved.imageName);
+        if (typeof saved.expiryMs === 'number') setExpiryMs(saved.expiryMs);
+      }
+    } catch {}
+  }, [draftKey]);
+
+  useEffect(() => {
+    const payload = { text, imageData, imageName, expiryMs, ts: Date.now() };
+    try { localStorage.setItem(draftKey, JSON.stringify(payload)); } catch {}
+  }, [draftKey, text, imageData, imageName, expiryMs]);
+
+  useEffect(() => {
+    if (!feedFocus || !feedFocus.postId) return;
+    if (feedFocus.mode) setMode(feedFocus.mode);
+    if (feedFocus.openReplies) {
+      setOpenReplies(prev => ({ ...prev, [feedFocus.postId]: true }));
+    }
+    const el = postRefs.current[feedFocus.postId];
+    if (el && el.scrollIntoView) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    if (setFeedFocus) setFeedFocus(null);
+  }, [feedFocus, feedItems.length, setFeedFocus]);
 
   return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column', padding: 14, gap: 12, overflow: 'hidden', position: 'relative' } },
     e('div', { style: { display: 'flex', gap: 8 } },
@@ -2332,6 +2481,15 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
         }
       }, 'Peers'),
       e('button', {
+        onClick: () => setMode('mine'),
+        className: 'boost-btn',
+        style: {
+          flex: 1, padding: '8px 12px', borderRadius: 999, border: '1px solid var(--border)',
+          background: mode === 'mine' ? 'var(--bg-card2)' : 'transparent',
+          color: mode === 'mine' ? 'var(--accent)' : 'var(--text-secondary)', fontWeight: 600, fontSize: 12
+        }
+      }, 'My Posts'),
+      e('button', {
         onClick: () => setMode('geofeed'),
         className: 'boost-btn',
         style: {
@@ -2343,10 +2501,11 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
     ),
     e('div', { style: { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, paddingRight: 2 } },
       feedItems.length === 0 && e('div', { style: { padding: 16, textAlign: 'center', color: 'var(--text-secondary)', fontSize: 12 } },
-        mode === 'geofeed' ? 'No geofeed posts yet.' : 'No peer posts yet.'
+        mode === 'geofeed' ? 'No geofeed posts yet.' : mode === 'mine' ? 'No posts yet.' : 'No peer posts yet.'
       ),
       feedItems.map(item => e('div', {
         key: item.id,
+        ref: (el) => { postRefs.current[item.id] = el; },
         style: { background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 16, padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }
       },
         e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
@@ -2360,12 +2519,20 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
         ),
         e('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
           e('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
-            ['👍', '🔥', '😂', '😮', '😢'].map(rx => e('button', {
-              key: rx,
-              onClick: () => addReaction(item.id, rx),
-              className: 'boost-btn',
-              style: { border: '1px solid var(--border)', background: 'var(--bg-card2)', borderRadius: 999, padding: '4px 8px', fontSize: 12, cursor: 'pointer', color: 'var(--text-primary)' }
-            }, rx + (item.reactions && item.reactions[rx] ? ' ' + item.reactions[rx] : '')))
+            ['👍', '🔥', '😂', '😮', '😢'].map(rx => {
+              const isMine = item.reactionsBy && item.reactionsBy[profile.peerId] === rx;
+              return e('button', {
+                key: rx,
+                onClick: () => addReaction(item.id, rx, item.feed === 'geofeed' ? 'geofeed' : 'peers'),
+                className: 'boost-btn',
+                style: {
+                  border: '1px solid ' + (isMine ? 'var(--accent)' : 'var(--border)'),
+                  background: isMine ? 'var(--accent)' : 'var(--bg-card2)',
+                  borderRadius: 999, padding: '4px 8px', fontSize: 12, cursor: 'pointer',
+                  color: isMine ? '#fff' : 'var(--text-primary)'
+                }
+              }, rx + (item.reactions && item.reactions[rx] ? ' ' + item.reactions[rx] : ''));
+            })
           ),
           e('button', {
             onClick: () => setOpenReplies(prev => ({ ...prev, [item.id]: !prev[item.id] })),
@@ -2390,7 +2557,7 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
               style: { flex: 1, background: 'var(--bg-deep)', border: '1px solid var(--border)', borderRadius: 999, padding: '6px 12px', color: 'var(--text-primary)', fontSize: 12 }
             }),
             e('button', {
-              onClick: () => addReply(item.id),
+              onClick: () => addReply(item.id, item.feed === 'geofeed' ? 'geofeed' : 'peers'),
               className: 'boost-btn',
               style: { border: '1px solid var(--border)', background: 'var(--accent)', color: '#fff', borderRadius: 999, padding: '6px 12px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }
             }, 'Send')
@@ -2407,9 +2574,9 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
         borderRadius: 999, padding: '10px 16px', fontWeight: 700, fontSize: 12, cursor: 'pointer',
         boxShadow: 'var(--shadow-soft)'
       }
-    }, 'Post'),
+    }, 'Post' + (hasDraft ? ' · Draft' : '')),
     showComposer && e('div', {
-      onClick: () => setShowComposer(false),
+      onClick: () => closeComposer(),
       style: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 10, display: 'flex', alignItems: 'flex-end', padding: 12 }
     },
       e('div', {
@@ -2422,7 +2589,7 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
         e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 } },
           e('div', { style: { fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' } }, mode === 'geofeed' ? 'Post to Geofeed' : 'Post to Peers'),
           e('button', {
-            onClick: () => setShowComposer(false),
+            onClick: () => closeComposer(),
             className: 'boost-btn',
             style: { background: 'transparent', border: '1px solid var(--border)', borderRadius: 8, padding: '4px 8px', fontSize: 11, color: 'var(--text-secondary)', cursor: 'pointer' }
           }, 'Close')
@@ -3933,6 +4100,15 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
           },
           className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--amber)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
         }, '⬆️ Import Blips'),
+        e('button', {
+          onClick: () => {
+            if (!confirm('Clean up mixed posts and fix feed separation?')) return;
+            setPosts(prev => prev.map(p => ({ ...p, feed: p.feed || 'peers' })).filter(p => p.feed !== 'geofeed'));
+            setGeoPosts(prev => prev.map(p => ({ ...p, feed: p.feed || 'geofeed' })).filter(p => p.feed === 'geofeed'));
+            showToast('Posts cleaned', 'var(--neon-green)');
+          },
+          className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
+        }, 'Clean Mixed Posts'),
         e('button', {
           onClick: () => {
             if (confirm('Clear ALL data? This cannot be undone.')) {
