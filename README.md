@@ -87,6 +87,10 @@ How to get them:
   - body: `{ to, from, senderName }`
 - `GET /health`
   - returns `{ ok: true }`
+- `POST /geofeed/post`
+  - body: `{ post }` (requires `post.id` and `post.zoneKey`)
+- `GET /geofeed/pull`
+  - query: `zoneKey`, optional `limit`, optional `before`
 
 Notes:
 - Subscriptions are stored in memory (restart clears them).
@@ -99,6 +103,39 @@ In Boost settings:
 - Relay Server URL: `http://your-server:8787`
 - VAPID Public Key: (your generated public key)
 - Click `Register Device` on each client
+
+## Geofeed Relay (Optional)
+
+Geofeed posts are peer-to-peer by default (only your connected peers).  
+To see **nearby posts from non-connected peers**, configure the relay.
+
+### Setup
+
+1. Use the same relay server in `server/` (no extra install needed).
+2. Start the relay:
+   - `npm start`
+3. In Boost settings → Geochat:
+   - Set **Geofeed Relay URL** to `http://your-server:8787`
+
+### Behavior
+
+- The app publishes geofeed posts to the relay.
+- The app pulls nearby posts by `zoneKey` every ~30s.
+- Pagination is supported via `limit` and `before` query params.
+
+### Rate Limits (Relay)
+
+- `POST /geofeed/post`: 60 requests per minute per IP
+- `GET /geofeed/pull`: 120 requests per minute per IP
+
+### Troubleshooting
+
+If Geofeed relay posts don’t appear:
+- Check the **Geofeed Relay URL** is reachable and correct.
+- Ensure the relay is running and `/health` returns `{ ok: true }`.
+- Verify CORS is enabled on the relay (default server enables it).
+- If running on HTTPS, make sure the relay is also HTTPS to avoid mixed content blocks.
+- The relay stores data in memory only — restarting clears all geofeed posts.
 
 ## Tech Stack
 - React 18 (CDN)

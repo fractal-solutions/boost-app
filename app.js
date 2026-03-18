@@ -364,7 +364,7 @@ const EXPIRY_OPTIONS = [
 const DEFAULT_SETTINGS = {
   peerServer: { useDefault: true, host: '', port: 9000, path: '/', key: '', secure: true },
   iceServers: { enabled: false, servers: [] },
-  geochat: { enabled: false, zoneRadius: 1000, anonymous: true, messageExpiry: 24 },
+  geochat: { enabled: false, zoneRadius: 1000, anonymous: true, messageExpiry: 24, relayUrl: '' },
   map: { defaultZoom: 14, hiddenCategories: [], darkTiles: true },
   ui: { theme: 'obsidian' },
   push: { enabled: false, serverUrl: '', vapidPublicKey: '' },
@@ -2144,9 +2144,11 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
           const unread = unreadCounts[peer.peerId] || 0;
           const shareActive = !!peer.shareActive;
           const shareOut = !!peer.shareOut;
+          const shareIn = !!peer.shareIn;
           const blocked = !!peer.blocked;
           const shareLabel = blocked ? 'Blocked' : shareActive ? 'Sharing' : shareOut ? 'Pending' : 'Share';
           const shareTone = blocked ? 'var(--magenta)' : shareActive ? 'var(--neon-green)' : shareOut ? 'var(--amber)' : 'var(--text-secondary)';
+          const incomingShare = shareIn && !shareOut && !shareActive && !blocked;
           return e('div', {
             key: peer.peerId,
             onClick: () => setActiveChatPeer(peer.peerId),
@@ -2167,6 +2169,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
               e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 3, gap: 8 } },
                 e('span', { style: { fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 } }, lastMsg ? lastMsg.text : (peer.connected ? 'Connected' : 'Offline')) ,
                 e('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 } },
+                  incomingShare && e('span', { style: { background: 'var(--amber)', color: '#1b1410', fontSize: 9, fontWeight: 800, borderRadius: 999, padding: '2px 6px', letterSpacing: 0.4 } }, 'Wants to share'),
                   e('button', {
                     onClick: (ev) => { ev.stopPropagation(); if (!blocked) toggleLocationShare(peer.peerId, !shareOut); },
                     className: 'boost-btn',
@@ -2450,6 +2453,7 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
   const draftKey = 'boost_feed_draft_' + (mode || 'peers');
   const hasDraft = !!((text && text.trim()) || imageData);
   const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const [relayStatus, setRelayStatus] = useState('idle');
   const MAX_LEN = 280;
   const MAX_IMAGE_BYTES = 1500 * 1024;
   const zoneRadius = settings.geochat.zoneRadius || 1000;
@@ -2474,6 +2478,35 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
       return p.zoneKey === zoneKey;
     });
   }, [geoPosts, settings.geochat.enabled, zoneKey, profile.peerId]);
+
+  useEffect(() => {
+    const relayUrl = (settings.geochat && settings.geochat.relayUrl || '').replace(/\/$/, '');
+    if (!relayUrl || !zoneKey) return;
+    let cancelled = false;
+    async function pull() {
+      try {
+        const res = await fetch(relayUrl + '/geofeed/pull?zoneKey=' + encodeURIComponent(zoneKey) + '&limit=50');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled || !data || !Array.isArray(data.posts)) return;
+        setGeoPosts(prev => {
+          const map = new Map(prev.map(p => [p.id, p]));
+          data.posts.forEach(p => {
+            if (!p || !p.id) return;
+            const incoming = { ...p, feed: 'geofeed' };
+            if (!incoming.expiresAt || incoming.expiresAt > Date.now()) {
+              map.set(incoming.id, map.get(incoming.id) || incoming);
+            }
+          });
+          return Array.from(map.values()).slice(0, 200);
+        });
+        setRelayStatus('connected');
+      } catch {}
+    }
+    pull();
+    const id = setInterval(pull, 30000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [settings.geochat && settings.geochat.relayUrl, zoneKey]);
 
   async function compressImage(file) {
     if (!file) return '';
@@ -2565,6 +2598,14 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
     if (mode === 'geofeed') {
       setGeoPosts(prev => [post, ...prev].slice(0, 200));
       sendReliableToAllPeers({ type: 'geofeed_post', post });
+      if (settings.geochat && settings.geochat.relayUrl) {
+        const relayUrl = settings.geochat.relayUrl.replace(/\/$/, '');
+        fetch(relayUrl + '/geofeed/post', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ post })
+        }).catch(() => {});
+      }
       showToast(navigator.onLine ? 'Posted to Geofeed' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
     } else {
       setPosts(prev => [post, ...prev].slice(0, 200));
@@ -2650,6 +2691,14 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
     if (targetFeed === 'geofeed') {
       setGeoPosts(prev => [repost, ...prev].slice(0, 200));
       sendReliableToAllPeers({ type: 'geofeed_post', post: repost });
+      if (settings.geochat && settings.geochat.relayUrl) {
+        const relayUrl = settings.geochat.relayUrl.replace(/\/$/, '');
+        fetch(relayUrl + '/geofeed/post', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ post: repost })
+        }).catch(() => {});
+      }
       showToast(navigator.onLine ? 'Reposted to Geofeed' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
     } else {
       setPosts(prev => [repost, ...prev].slice(0, 200));
@@ -2749,6 +2798,9 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
         }
       }, 'Geofeed'),
     ),
+    mode === 'geofeed' && settings.geochat && settings.geochat.relayUrl && e('div', {
+      style: { fontSize: 10, color: relayStatus === 'connected' ? 'var(--neon-green)' : 'var(--text-secondary)' }
+    }, relayStatus === 'connected' ? 'Relay Connected' : 'Relay Connecting...'),
     e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: -4 } },
       mode === 'geofeed'
         ? 'Geofeed is public to peers in your zone.'
@@ -3020,6 +3072,14 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     ];
   }
 
+  function setRouteTargetFresh(target) {
+    setRouteTarget(target);
+    setRouteActive(false);
+    setRouteData(null);
+    setRouteError(false);
+    lastRouteKeyRef.current = null;
+  }
+
   // Initialize map
   useEffect(() => {
     if (!mapContainerRef.current || leafletMapRef.current) return;
@@ -3095,7 +3155,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     const map = leafletMapRef.current;
     function handlePick(ev) {
       setAwaitingMapPick(false);
-      setRouteTarget({ lat: ev.latlng.lat, lng: ev.latlng.lng, label: 'Custom location' });
+      setRouteTargetFresh({ lat: ev.latlng.lat, lng: ev.latlng.lng, label: 'Custom location' });
       showToast('Waypoint set', 'var(--neon-green)');
     }
     map.on('click', handlePick);
@@ -3246,6 +3306,9 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
           fillColor: color,
           fillOpacity: 0.6,
         });
+        marker.on('click', () => {
+          setRouteTargetFresh({ lat: target.lat, lng: target.lng, label: name });
+        });
         marker.bindTooltip(tooltipHtml, { direction: 'top', offset: [0, -8], opacity: 0.95 });
         marker.addTo(layer);
         markers[p.peerId] = marker;
@@ -3365,8 +3428,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   useEffect(() => {
     window.__boost_open_route = (target) => {
       if (!target) return;
-      setRouteTarget({ lat: target.lat, lng: target.lng, label: target.label || 'Peer' });
-      setRouteActive(false);
+      setRouteTargetFresh({ lat: target.lat, lng: target.lng, label: target.label || 'Peer' });
     };
     return () => { if (window.__boost_open_route) delete window.__boost_open_route; };
   }, []);
@@ -3401,8 +3463,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       onUpdate: handleUpdateBlip,
       onDelete: handleDeleteBlip,
       onRoute: (blip) => {
-        setRouteTarget({ lat: blip.lat, lng: blip.lng, label: blip.title });
-        setRouteActive(false);
+        setRouteTargetFresh({ lat: blip.lat, lng: blip.lng, label: blip.title });
       },
       logActivity,
       profile,
@@ -3432,7 +3493,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
             ? e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' } }, 'No shared peers yet.')
             : sharePeers.map(p => e('button', {
                 key: p.peerId,
-                onClick: () => { setRouteTarget({ lat: p.lastLoc.lat, lng: p.lastLoc.lng, label: p.displayName || p.peerId }); setShowWaypoint(false); },
+                onClick: () => { setRouteTargetFresh({ lat: p.lastLoc.lat, lng: p.lastLoc.lng, label: p.displayName || p.peerId }); setShowWaypoint(false); },
                 className: 'boost-btn',
                 style: { width: '100%', textAlign: 'left', background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 10, padding: '8px 10px', marginBottom: 6, color: 'var(--text-primary)', cursor: 'pointer' }
               }, (p.displayName || p.peerId))),
@@ -3443,7 +3504,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
             ? e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' } }, 'No visible blips.')
             : visibleBlips.slice(0, blipListLimit).map(b => e('button', {
                 key: b.id,
-                onClick: () => { setRouteTarget({ lat: b.lat, lng: b.lng, label: b.title }); setShowWaypoint(false); },
+                onClick: () => { setRouteTargetFresh({ lat: b.lat, lng: b.lng, label: b.title }); setShowWaypoint(false); },
                 className: 'boost-btn',
                 style: { width: '100%', textAlign: 'left', background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 10, padding: '8px 10px', marginBottom: 6, color: 'var(--text-primary)', cursor: 'pointer' }
               }, b.title)),
@@ -3771,6 +3832,7 @@ function GeochatView({ position, geochatMessages, setGeochatMessages, profile, s
 function SettingsView({ profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, hiddenPosts, setHiddenPosts, peers, setPeers, categories, runDailyBackup }) {
   const [section, setSection] = useState(null);
   const [showQR, setShowQR] = useState(false);
+  const [showHelp, setShowHelp] = useState(false);
   const [newBlipType, setNewBlipType] = useState({ label: '', icon: '', color: 'var(--accent)' });
   const customBlipTypes = settings.customBlipTypes || [];
   const colorOptions = [
@@ -4316,6 +4378,16 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
           style: { width: '100%', accentColor: 'var(--accent)' }
         }),
       ),
+      e('div', { style: { marginTop: 10 } },
+        e('div', { style: labelStyle }, 'GEOFEED RELAY URL (OPTIONAL)'),
+        e('input', {
+          value: settings.geochat.relayUrl || '',
+          onChange: (ev) => updateSettings('geochat.relayUrl', ev.target.value),
+          placeholder: 'https://your-relay.example.com',
+          style: inputStyle
+        }),
+        e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 } }, 'Use a relay to see nearby posts beyond your connected peers.')
+      ),
     ),
 
     // Map Settings
@@ -4523,6 +4595,96 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
       ),
       !window.showDirectoryPicker && e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'This browser cannot save to folders. Backups are stored in-app and will be removed if you clear site data.'),
       window.showDirectoryPicker && e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'Saves to: selected folder / boost / boost-backup(name).json'),
+    ),
+
+    // Help
+    e('div', { style: sectionStyle },
+      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, 'Help'),
+      e('button', {
+        onClick: () => setShowHelp(true),
+        className: 'boost-btn',
+        style: { padding: '10px 14px', borderRadius: 10, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 12, cursor: 'pointer', fontWeight: 700 }
+      }, 'Open Help')
+    ),
+
+    showHelp && e('div', {
+      onClick: () => setShowHelp(false),
+      style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }
+    },
+      e('div', {
+        onClick: (ev) => ev.stopPropagation(),
+        style: { width: '100%', maxWidth: 640, maxHeight: '82vh', overflow: 'auto', background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 18, padding: 18, boxShadow: 'var(--shadow-strong)' }
+      },
+        e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 } },
+          e('div', { style: { fontSize: 16, fontWeight: 800, color: 'var(--text-primary)' } }, 'Boost Help'),
+          e('button', {
+            onClick: () => setShowHelp(false),
+            className: 'boost-btn',
+            style: { border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-secondary)', borderRadius: 10, padding: '6px 10px', fontSize: 11, cursor: 'pointer' }
+          }, 'Close')
+        ),
+        e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 14 } }, 'Concise setup notes pulled from the project README.'),
+
+        e('div', { style: { display: 'grid', gap: 10 } },
+          e('div', { style: { padding: 12, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg-card2)' } },
+            e('div', { style: { fontSize: 12, fontWeight: 800, marginBottom: 6 } }, 'Relay Server Setup (Push + Geofeed)'),
+            e('div', { style: { fontSize: 12, color: 'var(--text-secondary)' } },
+              '1) Go to the `server/` folder. 2) Run `npm install`. 3) Generate VAPID keys with `npx web-push generate-vapid-keys`. 4) Set env vars: `VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_KEY`, optional `VAPID_SUBJECT`, optional `PORT` (default 8787). 5) Start: `npm start`.'
+            ),
+            e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'Hosting: deploy the `server/` folder to any Node host (Render, Fly, Railway, VPS). Ensure HTTPS in production.'),
+            e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 8 } }, 'Example `.env`:'),
+            e('pre', { style: { marginTop: 6, background: 'var(--bg-deep)', border: '1px solid var(--border)', borderRadius: 10, padding: 10, fontSize: 11, color: 'var(--text-primary)', overflow: 'auto' } },
+`VAPID_PUBLIC_KEY=YOUR_PUBLIC_KEY
+VAPID_PRIVATE_KEY=YOUR_PRIVATE_KEY
+VAPID_SUBJECT=mailto:admin@example.com
+PORT=8787`
+            ),
+          ),
+          e('div', { style: { padding: 12, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg-card2)' } },
+            e('div', { style: { fontSize: 12, fontWeight: 800, marginBottom: 6 } }, 'App Configuration'),
+            e('div', { style: { fontSize: 12, color: 'var(--text-secondary)' } },
+              'In Boost Settings: set Relay Server URL (for push), add VAPID public key, and click Register Device. For Geofeed relay, set Geofeed Relay URL in Geochat.'
+            ),
+            e('div', { style: { display: 'flex', gap: 8, marginTop: 8 } },
+              e('button', {
+                onClick: () => {
+                  const url = (settings.geochat && settings.geochat.relayUrl || '').replace(/\/$/, '');
+                  if (!url) return showToast('Set Geofeed Relay URL first', 'var(--amber)');
+                  fetch(url + '/health').then(r => r.json()).then(() => {
+                    showToast('Relay OK', 'var(--neon-green)');
+                  }).catch(() => showToast('Relay not reachable', 'var(--magenta)'));
+                },
+                className: 'boost-btn',
+                style: { padding: '6px 10px', borderRadius: 8, background: 'var(--bg-deep)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 11, cursor: 'pointer' }
+              }, 'Test Relay'),
+            )
+          ),
+          e('div', { style: { padding: 12, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg-card2)' } },
+            e('div', { style: { fontSize: 12, fontWeight: 800, marginBottom: 6 } }, 'Geofeed Relay (Optional)'),
+            e('div', { style: { fontSize: 12, color: 'var(--text-secondary)' } },
+              'Geofeed is public to nearby users via relay. The app publishes geofeed posts to the relay and pulls by zone about every 30s. Endpoints: POST `/geofeed/post`, GET `/geofeed/pull?zoneKey=...&limit=50`.'
+            ),
+          ),
+          e('div', { style: { padding: 12, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg-card2)' } },
+            e('div', { style: { fontSize: 12, fontWeight: 800, marginBottom: 6 } }, 'Push Buzz Relay (Optional)'),
+            e('div', { style: { fontSize: 12, color: 'var(--text-secondary)' } },
+              'Endpoints: POST `/subscribe`, POST `/unsubscribe`, POST `/buzz`. Subscriptions are stored in memory by default.'
+            ),
+          ),
+          e('div', { style: { padding: 12, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg-card2)' } },
+            e('div', { style: { fontSize: 12, fontWeight: 800, marginBottom: 6 } }, 'Backups'),
+            e('div', { style: { fontSize: 12, color: 'var(--text-secondary)' } },
+              'Daily backups can save to a folder (supported browsers) or in-app storage. Export All downloads a full JSON backup.'
+            ),
+          ),
+          e('div', { style: { padding: 12, border: '1px solid var(--border)', borderRadius: 12, background: 'var(--bg-card2)' } },
+            e('div', { style: { fontSize: 12, fontWeight: 800, marginBottom: 6 } }, 'Troubleshooting'),
+            e('div', { style: { fontSize: 12, color: 'var(--text-secondary)' } },
+              'If relay posts don’t appear: confirm `/health` returns `{ ok: true }`, check CORS, and avoid mixed-content (HTTPS app + HTTP relay). Relay storage is in-memory (restart clears posts).'
+            ),
+          ),
+        )
+      )
     ),
 
     // About
