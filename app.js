@@ -8,6 +8,7 @@ const PING_INTERVAL_MS = 7000;
 const PONG_TIMEOUT_MS = 18000;
 const ACTIVITY_MAX = 200;
 const LOC_STALE_MS = 20000;
+const SIGNED_TYPES = ['post', 'geofeed_post', 'post_delete', 'blip', 'blip_update', 'blip_delete', 'blip_comment'];
 
 function generateId(prefix = '') {
   return prefix + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
@@ -70,6 +71,14 @@ function slugify(value) {
     .trim()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
+}
+
+function stableStringify(obj) {
+  if (obj === null || obj === undefined) return '';
+  if (typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
 }
 
 
@@ -859,6 +868,7 @@ function App() {
       .filter(p => p.feed === 'geofeed')
       .filter(p => !p.expiresAt || p.expiresAt > Date.now());
   });
+  const [hiddenPosts, setHiddenPosts] = useState(() => loadStorageWithMigration(deviceId, 'hidden_posts', []));
   const [lastBackupAt, setLastBackupAt] = useState(() => loadStorage('boost_last_backup_at', 0));
   const [position, setPosition] = useState(null);
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
@@ -868,6 +878,8 @@ function App() {
   const [networkOnline, setNetworkOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
   const [feedFocus, setFeedFocus] = useState(null);
   const [activityUnread, setActivityUnread] = useState(0);
+  const [swUpdateReady, setSwUpdateReady] = useState(false);
+  const [signReady, setSignReady] = useState(false);
 
   const peerRef = useRef(null);
   const connectionsRef = useRef({});
@@ -877,7 +889,9 @@ function App() {
   const geoPostsRef = useRef([]);
   const peerKeysRef = useRef({});
   const peerPubRef = useRef({});
+  const peerSignPubRef = useRef({});
   const localKeyRef = useRef({ pair: null, pubJwk: null });
+  const localSignKeyRef = useRef({ pair: null, pubJwk: null });
   const lastLocSentRef = useRef(0);
   const mapRef = useRef(null);
   const markersRef = useRef({});
@@ -900,15 +914,31 @@ function App() {
   const allCategories = useMemo(() => getAllCategories(settings.customBlipTypes), [settings.customBlipTypes]);
   useEffect(() => { saveStorage(peersKey, peers); }, [peers]);
   useEffect(() => { peersRef.current = peers; }, [peers]);
-  useEffect(() => { saveStorage(messagesKey, messages); }, [messages]);
-  useEffect(() => { saveStorage(blipsKey, blips); }, [blips]);
-  useEffect(() => { saveStorage(geochatKey, geochatMessages); }, [geochatMessages]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(messagesKey, messages), 600);
+    return () => clearTimeout(t);
+  }, [messages]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(blipsKey, blips), 600);
+    return () => clearTimeout(t);
+  }, [blips]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(geochatKey, geochatMessages), 600);
+    return () => clearTimeout(t);
+  }, [geochatMessages]);
   useEffect(() => { saveStorage(outboxKey, outbox); }, [outbox]);
   useEffect(() => { saveStorage(activityKey, activity); }, [activity]);
+  useEffect(() => { saveStorage(storageKey('hidden_posts', deviceId), hiddenPosts); }, [hiddenPosts]);
   useEffect(() => { postsRef.current = posts; }, [posts]);
   useEffect(() => { geoPostsRef.current = geoPosts; }, [geoPosts]);
-  useEffect(() => { saveStorage(postsKey, posts); }, [posts]);
-  useEffect(() => { saveStorage(geoPostsKey, geoPosts); }, [geoPosts]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(postsKey, posts), 600);
+    return () => clearTimeout(t);
+  }, [posts]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(geoPostsKey, geoPosts), 600);
+    return () => clearTimeout(t);
+  }, [geoPosts]);
 
   useEffect(() => {
     function handleOnline() {
@@ -958,6 +988,31 @@ function App() {
     return () => { cancelled = true; };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stored = loadStorageMaybe('boost_sign_keys');
+        if (stored && stored.privateJwk && stored.publicJwk) {
+          const priv = await crypto.subtle.importKey('jwk', stored.privateJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+          const pub = await crypto.subtle.importKey('jwk', stored.publicJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+          if (cancelled) return;
+          localSignKeyRef.current = { pair: { privateKey: priv, publicKey: pub }, pubJwk: stored.publicJwk };
+          setSignReady(true);
+          return;
+        }
+        const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+        const publicJwk = await crypto.subtle.exportKey('jwk', pair.publicKey);
+        const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+        saveStorage('boost_sign_keys', { publicJwk, privateJwk });
+        if (cancelled) return;
+        localSignKeyRef.current = { pair, pubJwk: publicJwk };
+        setSignReady(true);
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   // Geolocation
   useEffect(() => {
     if (!navigator.geolocation) return;
@@ -974,6 +1029,37 @@ function App() {
     initPeer();
     return () => { if (peerRef.current) peerRef.current.destroy(); };
   }, []);
+
+  useEffect(() => {
+    const onUpdate = () => setSwUpdateReady(true);
+    window.addEventListener('boost-sw-updated', onUpdate);
+    return () => window.removeEventListener('boost-sw-updated', onUpdate);
+  }, []);
+
+  useEffect(() => {
+    if (!signReady || !localSignKeyRef.current.pubJwk) return;
+    Object.keys(connectionsRef.current).forEach(peerId => {
+      const conn = connectionsRef.current[peerId];
+      if (conn && conn.open) {
+        try { conn.send({ type: 'sign_pub', pub: localSignKeyRef.current.pubJwk }); } catch {}
+      }
+      const now = Date.now();
+      const recentPosts = (postsRef.current || []).filter(p => p.senderId === profile.peerId && (p.feed !== 'geofeed') && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      recentPosts.forEach(p => { sendToPeer(peerId, { type: 'post', post: p }); });
+      const recentGeo = (geoPostsRef.current || []).filter(p => p.senderId === profile.peerId && (p.feed === 'geofeed' || !p.feed) && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      recentGeo.forEach(p => { sendToPeer(peerId, { type: 'geofeed_post', post: p }); });
+    });
+  }, [signReady]);
+
+  function applyUpdate() {
+    if (!('serviceWorker' in navigator)) return window.location.reload();
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (reg && reg.waiting) {
+        reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+      }
+      setTimeout(() => window.location.reload(), 400);
+    }).catch(() => window.location.reload());
+  }
 
   function getPeerConfig() {
     const cfg = {};
@@ -1095,6 +1181,41 @@ function App() {
     }
   }
 
+  async function signData(data) {
+    if (!SIGNED_TYPES.includes(data.type)) return data;
+    if (!localSignKeyRef.current.pair || !crypto || !crypto.subtle) return data;
+    const base = { ...data };
+    delete base.sig;
+    delete base.sigBy;
+    delete base.sigTs;
+    const payload = new TextEncoder().encode(stableStringify(base));
+    try {
+      const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, localSignKeyRef.current.pair.privateKey, payload);
+      return { ...base, sig: arrayBufferToBase64(sig), sigBy: profile.peerId, sigTs: Date.now() };
+    } catch {
+      return data;
+    }
+  }
+
+  async function verifySignedData(fromPeer, data) {
+    if (!SIGNED_TYPES.includes(data.type)) return true;
+    if (!data.sig || !data.sigBy) return false;
+    if (data.sigBy !== fromPeer) return false;
+    const pubJwk = peerSignPubRef.current[fromPeer];
+    if (!pubJwk || !crypto || !crypto.subtle) return false;
+    try {
+      const pub = await crypto.subtle.importKey('jwk', pubJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+      const base = { ...data };
+      delete base.sig;
+      delete base.sigBy;
+      delete base.sigTs;
+      const payload = new TextEncoder().encode(stableStringify(base));
+      return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, pub, base64ToArrayBuffer(data.sig), payload);
+    } catch {
+      return false;
+    }
+  }
+
   function isPeerBlocked(peerId) {
     const peer = peersRef.current.find(p => p.peerId === peerId);
     return !!(peer && peer.blocked);
@@ -1115,6 +1236,11 @@ function App() {
     }
   }
 
+  function toggleMutePeer(peerId, muted) {
+    if (!peerId) return;
+    updatePeer(peerId, { muted: !!muted });
+  }
+
   function handleConnection(conn) {
     const peerId = conn.peer;
     if (isPeerBlocked(peerId)) {
@@ -1133,7 +1259,7 @@ function App() {
       });
       logActivity({ type: 'connect', title: 'Peer connected', peerId });
       // Send introduction
-      conn.send({ type: 'intro', displayName: profile.displayName, avatar: profile.avatar });
+      conn.send({ type: 'intro', displayName: profile.displayName, avatar: profile.avatar, signPub: localSignKeyRef.current.pubJwk || null });
       if (localKeyRef.current.pubJwk) {
         conn.send({ type: 'key_exchange', pub: localKeyRef.current.pubJwk });
       }
@@ -1206,10 +1332,23 @@ function App() {
     if (data.deliveryId && data.type !== 'ack') {
       try { connectionsRef.current[fromPeer] && connectionsRef.current[fromPeer].send({ type: 'ack', deliveryId: data.deliveryId }); } catch {}
     }
+    if (SIGNED_TYPES.includes(data.type)) {
+      const ok = await verifySignedData(fromPeer, data);
+      if (!ok) return;
+    }
 
     switch (data.type) {
       case 'intro':
-        setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, displayName: data.displayName || fromPeer, avatar: data.avatar } : p));
+        if (data.signPub) {
+          peerSignPubRef.current[fromPeer] = data.signPub;
+        }
+        setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, displayName: data.displayName || fromPeer, avatar: data.avatar, signPub: data.signPub || p.signPub } : p));
+        break;
+      case 'sign_pub':
+        if (data.pub) {
+          peerSignPubRef.current[fromPeer] = data.pub;
+          setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, signPub: data.pub } : p));
+        }
         break;
       case 'key_exchange':
         if (data.pub) {
@@ -1340,6 +1479,15 @@ function App() {
             if (prev.find(p => p.id === incoming.id)) return prev;
             return [incoming, ...prev].slice(0, 200);
           });
+        }
+        break;
+      case 'post_delete':
+        if (data.postId) {
+          if (data.feed === 'geofeed') {
+            setGeoPosts(prev => prev.filter(p => p.id !== data.postId));
+          } else {
+            setPosts(prev => prev.filter(p => p.id !== data.postId));
+          }
         }
         break;
       case 'post_reaction':
@@ -1476,7 +1624,8 @@ function App() {
     const conn = connectionsRef.current[peerId];
     if (conn && conn.open) {
       try {
-        const payload = (data.type === 'ack' || data.type === 'ping' || data.type === 'pong' || data.type === 'key_exchange') ? data : await encryptForPeer(peerId, data);
+        const signed = await signData(data);
+        const payload = (signed.type === 'ack' || signed.type === 'ping' || signed.type === 'pong' || signed.type === 'key_exchange') ? signed : await encryptForPeer(peerId, signed);
         conn.send(payload);
       } catch {}
     }
@@ -1487,8 +1636,8 @@ function App() {
     const deliveryId = data.deliveryId || generateId('out');
     const conn = connectionsRef.current[peerId];
     if (!conn || !conn.open) {
-      const payload = { ...data, deliveryId };
-      const wrapped = (data.type === 'ack' || data.type === 'ping' || data.type === 'pong' || data.type === 'key_exchange')
+      const payload = await signData({ ...data, deliveryId });
+      const wrapped = (payload.type === 'ack' || payload.type === 'ping' || payload.type === 'pong' || payload.type === 'key_exchange')
         ? payload
         : await encryptForPeer(peerId, payload);
       queueOutbox(peerId, wrapped, deliveryId);
@@ -1497,8 +1646,8 @@ function App() {
     }
     if (navigator.onLine) {
       try {
-        const payload = { ...data, deliveryId };
-        const wrapped = (data.type === 'ack' || data.type === 'ping' || data.type === 'pong' || data.type === 'key_exchange')
+        const payload = await signData({ ...data, deliveryId });
+        const wrapped = (payload.type === 'ack' || payload.type === 'ping' || payload.type === 'pong' || payload.type === 'key_exchange')
           ? payload
           : await encryptForPeer(peerId, payload);
         queueOutbox(peerId, wrapped, deliveryId);
@@ -1528,6 +1677,7 @@ function App() {
       posts,
       geoPosts,
       activity,
+      hiddenPosts,
     };
   }
 
@@ -1685,6 +1835,13 @@ function App() {
   }, []);
 
   const connectedPeersCount = peers.filter(p => p.connected).length;
+  const mutedPeerIds = useMemo(() => new Set(peers.filter(p => p.muted).map(p => p.peerId)), [peers]);
+
+  useEffect(() => {
+    if (activeTab === 'activity') {
+      setActivityUnread(0);
+    }
+  }, [activeTab]);
 
   // Layout
   return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column', background: 'var(--bg-deep)' } },
@@ -1692,16 +1849,30 @@ function App() {
     e(Header, { profile, connectionStatus, connectedPeersCount, onReconnect: initPeer }),
     // Main content area
     e('div', { style: { flex: 1, overflow: 'hidden', position: 'relative' } },
-      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
+      swUpdateReady && e('div', {
+        style: {
+          position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)',
+          zIndex: 50, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 999,
+          padding: '6px 12px', display: 'flex', gap: 8, alignItems: 'center', boxShadow: 'var(--shadow-soft)'
+        }
+      },
+        e('span', { style: { fontSize: 11, color: 'var(--text-primary)', fontWeight: 600 } }, 'Update available'),
+        e('button', {
+          onClick: applyUpdate,
+          className: 'boost-btn',
+          style: { background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 999, padding: '4px 10px', fontSize: 11, cursor: 'pointer', fontWeight: 700 }
+        }, 'Refresh')
+      ),
+      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories: allCategories, setActiveTab }),
       activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories: allCategories, logActivity }),
-      activeTab === 'feed' && e(FeedView, { position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings, feedFocus, setFeedFocus }),
+      activeTab === 'feed' && e(FeedView, { position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings, feedFocus, setFeedFocus, hiddenPosts, setHiddenPosts, mutedPeerIds, toggleMutePeer }),
       activeTab === 'geochat' && e(GeochatView, { position, geochatMessages, setGeochatMessages, profile, sendToAllPeers, settings }),
       activeTab === 'activity' && e(ActivityView, { activity, peers, onOpenActivity: (action) => {
         if (!action) return;
         if (action.tab) setActiveTab(action.tab);
         if (action.tab === 'feed') setFeedFocus(action);
       }}),
-      activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, peers, setPeers, categories: allCategories, runDailyBackup }),
+      activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, hiddenPosts, setHiddenPosts, peers, setPeers, categories: allCategories, runDailyBackup }),
     ),
     // Bottom nav
     e(BottomNav, { activeTab, setActiveTab, unreadCounts, activityUnread })
@@ -1783,19 +1954,11 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts, activityUnread }) {
         opacity: activeTab === tab.id ? 1 : 0.5,
       }
     },
-      tab.id === 'chat' && totalUnread > 0 && e('span', {
-        style: {
-          position: 'absolute', top: 6, right: 16, background: 'var(--magenta)', color: '#fff',
-          fontSize: 9, fontWeight: 700, borderRadius: 10, padding: '1px 5px', minWidth: 16, textAlign: 'center',
-        }
-      }, totalUnread > 9 ? '9+' : totalUnread),
-      tab.id === 'activity' && activityUnread > 0 && e('span', {
-        style: {
-          position: 'absolute', top: 6, right: 16, background: 'var(--amber)', color: '#fff',
-          fontSize: 9, fontWeight: 700, borderRadius: 10, padding: '1px 5px', minWidth: 16, textAlign: 'center',
-        }
-      }, activityUnread > 9 ? '9+' : activityUnread),
-      e('span', { style: { fontSize: 11, fontWeight: 600, color: activeTab === tab.id ? 'var(--accent)' : 'var(--text-secondary)', letterSpacing: 0.4 } }, tab.label),
+      e('span', { className: 'tab-label', style: { fontSize: 11, fontWeight: 600, color: activeTab === tab.id ? 'var(--accent)' : 'var(--text-secondary)', letterSpacing: 0.4 } },
+        tab.label,
+        tab.id === 'chat' && totalUnread > 0 && e('span', { className: 'tab-dot' }),
+        tab.id === 'activity' && activityUnread > 0 && e('span', { className: 'tab-dot tab-dot-amber' }),
+      ),
       activeTab === tab.id && e('div', { className: 'tab-indicator' }),
     ))
   );
@@ -1803,7 +1966,7 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts, activityUnread }) {
 
 // ========================== CHAT VIEW ==========================
 
-function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories }) {
+function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories, setActiveTab }) {
   const [connectInput, setConnectInput] = useState('');
   const [showConnect, setShowConnect] = useState(false);
   const [showQR, setShowQR] = useState(false);
@@ -1828,11 +1991,6 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
     setConfirmState(null);
   }, [activeChatPeer]);
 
-  useEffect(() => {
-    if (activeTab === 'activity') {
-      setActivityUnread(0);
-    }
-  }, [activeTab]);
 
   function handleConnect() {
     const id = connectInput.trim();
@@ -2278,7 +2436,7 @@ function ActivityView({ activity, peers, onOpenActivity }) {
 
 // ========================== FEED VIEW ==========================
 
-function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings, feedFocus, setFeedFocus }) {
+function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings, feedFocus, setFeedFocus, hiddenPosts, setHiddenPosts, mutedPeerIds, toggleMutePeer }) {
   const [mode, setMode] = useState('peers');
   const [text, setText] = useState('');
   const [imageData, setImageData] = useState('');
@@ -2291,6 +2449,7 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
   const postRefs = useRef({});
   const draftKey = 'boost_feed_draft_' + (mode || 'peers');
   const hasDraft = !!((text && text.trim()) || imageData);
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
   const MAX_LEN = 280;
   const MAX_IMAGE_BYTES = 1500 * 1024;
   const zoneRadius = settings.geochat.zoneRadius || 1000;
@@ -2316,6 +2475,26 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
     });
   }, [geoPosts, settings.geochat.enabled, zoneKey, profile.peerId]);
 
+  async function compressImage(file) {
+    if (!file) return '';
+    if (!window.createImageBitmap) {
+      return await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result || '');
+        reader.readAsDataURL(file);
+      });
+    }
+    const bitmap = await createImageBitmap(file);
+    const maxSize = 1280;
+    const scale = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.75);
+  }
+
   function handleImage(ev) {
     const file = ev.target.files && ev.target.files[0];
     if (!file) return;
@@ -2327,12 +2506,15 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
       showToast('Image too large (max 1.5MB)', 'var(--amber)');
       return;
     }
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      setImageData(e.target.result || '');
+    compressImage(file).then((dataUrl) => {
+      if (!dataUrl) return;
+      if (dataUrl.length > 900000) {
+        showToast('Image too large after compression', 'var(--amber)');
+        return;
+      }
+      setImageData(dataUrl);
       setImageName(file.name || 'image');
-    };
-    reader.readAsDataURL(file);
+    });
   }
 
   function clearImage() {
@@ -2383,11 +2565,11 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
     if (mode === 'geofeed') {
       setGeoPosts(prev => [post, ...prev].slice(0, 200));
       sendReliableToAllPeers({ type: 'geofeed_post', post });
-      showToast('Posted to Geofeed', 'var(--neon-green)');
+      showToast(navigator.onLine ? 'Posted to Geofeed' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
     } else {
       setPosts(prev => [post, ...prev].slice(0, 200));
       sendReliableToAllPeers({ type: 'post', post });
-      showToast('Posted to Peers', 'var(--neon-green)');
+      showToast(navigator.onLine ? 'Posted to Peers' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
     }
     setText('');
     clearImage();
@@ -2436,8 +2618,76 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
     setOpenReplies(prev => ({ ...prev, [postId]: true }));
   }
 
+  function handleRepost(item) {
+    if (!item) return;
+    const targetFeed = item.feed === 'geofeed' ? 'geofeed' : 'peers';
+    if (targetFeed === 'geofeed') {
+      if (!settings.geochat.enabled) {
+        showToast('Enable Geochat to repost to Geofeed', 'var(--magenta)');
+        return;
+      }
+      if (!position) {
+        showToast('Location required for Geofeed', 'var(--magenta)');
+        return;
+      }
+    }
+    const repost = {
+      id: generateId('post'),
+      senderId: profile.peerId,
+      sender: profile.displayName || profile.peerId,
+      text: '',
+      image: null,
+      imageName: null,
+      repostOf: { id: item.id, sender: item.sender, text: item.text || '' },
+      timestamp: Date.now(),
+      expiresAt: Date.now() + 48 * 60 * 60 * 1000,
+      feed: targetFeed,
+      lat: position ? position.lat : null,
+      lng: position ? position.lng : null,
+      zoneKey: position ? getZoneKey(position.lat, position.lng, zoneRadius) : null,
+      zoneRadius,
+    };
+    if (targetFeed === 'geofeed') {
+      setGeoPosts(prev => [repost, ...prev].slice(0, 200));
+      sendReliableToAllPeers({ type: 'geofeed_post', post: repost });
+      showToast(navigator.onLine ? 'Reposted to Geofeed' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
+    } else {
+      setPosts(prev => [repost, ...prev].slice(0, 200));
+      sendReliableToAllPeers({ type: 'post', post: repost });
+      showToast(navigator.onLine ? 'Reposted to Peers' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
+    }
+  }
+
+  function hidePost(postId) {
+    if (!postId) return;
+    setHiddenPosts(prev => prev.includes(postId) ? prev : [...prev, postId]);
+    showToast('Post hidden', 'var(--amber)');
+  }
+
+  function deletePost(item) {
+    if (!item) return;
+    setDeleteConfirm({
+      title: 'Delete Post',
+      message: 'Delete this post for everyone? This cannot be undone.',
+      onConfirm: () => {
+        const feed = item.feed === 'geofeed' ? 'geofeed' : 'peers';
+        if (feed === 'geofeed') {
+          setGeoPosts(prev => prev.filter(p => p.id !== item.id));
+        } else {
+          setPosts(prev => prev.filter(p => p.id !== item.id));
+        }
+        sendReliableToAllPeers({ type: 'post_delete', feed, postId: item.id });
+        showToast('Post deleted', 'var(--amber)');
+      }
+    });
+    return;
+  }
+
+  const hiddenSet = useMemo(() => new Set(hiddenPosts || []), [hiddenPosts]);
   const feedItems = (mode === 'geofeed' ? filteredGeoFeed : mode === 'mine' ? filteredMineFeed : filteredPeersFeed)
-    .filter(p => !p.expiresAt || p.expiresAt > Date.now());
+    .filter(p => !p.expiresAt || p.expiresAt > Date.now())
+    .filter(p => !hiddenSet.has(p.id))
+    .filter(p => !mutedPeerIds || p.senderId === profile.peerId || !mutedPeerIds.has(p.senderId));
 
   useEffect(() => {
     try {
@@ -2499,6 +2749,13 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
         }
       }, 'Geofeed'),
     ),
+    e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: -4 } },
+      mode === 'geofeed'
+        ? 'Geofeed is public to peers in your zone.'
+        : mode === 'mine'
+          ? 'My Posts are visible to peers you connected with.'
+          : 'Peers feed is private between you and your peers.'
+    ),
     e('div', { style: { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, paddingRight: 2 } },
       feedItems.length === 0 && e('div', { style: { padding: 16, textAlign: 'center', color: 'var(--text-secondary)', fontSize: 12 } },
         mode === 'geofeed' ? 'No geofeed posts yet.' : mode === 'mine' ? 'No posts yet.' : 'No peer posts yet.'
@@ -2510,7 +2767,16 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
       },
         e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
           e('div', { style: { fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' } }, item.sender || 'Peer'),
-          e('div', { style: { fontSize: 10, color: 'var(--text-secondary)' } }, timeAgo(item.timestamp))
+          e('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+            e('span', { style: { fontSize: 9, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '2px 6px', borderRadius: 999 } },
+              item.feed === 'geofeed' ? 'Public' : 'Private'
+            ),
+            e('span', { style: { fontSize: 10, color: 'var(--text-secondary)' } }, timeAgo(item.timestamp))
+          )
+        ),
+        item.repostOf && e('div', { style: { borderLeft: '3px solid var(--border)', paddingLeft: 8, fontSize: 12, color: 'var(--text-secondary)' } },
+          e('div', { style: { fontWeight: 700, fontSize: 11, marginBottom: 2 } }, 'Repost · ' + (item.repostOf.sender || 'Peer')),
+          e('div', { style: { whiteSpace: 'pre-wrap' } }, item.repostOf.text || '')
         ),
         item.text && e('div', { style: { fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.4, whiteSpace: 'pre-wrap' } }, item.text),
         item.image && e('img', { src: item.image, alt: item.imageName || 'post image', style: { width: '100%', maxHeight: 260, objectFit: 'cover', borderRadius: 12, border: '1px solid var(--border)' } }),
@@ -2534,11 +2800,37 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
               }, rx + (item.reactions && item.reactions[rx] ? ' ' + item.reactions[rx] : ''));
             })
           ),
+          e('div', { style: { display: 'flex', gap: 6 } },
+            e('button', {
+              onClick: () => handleRepost(item),
+              className: 'boost-btn',
+              style: { border: '1px solid var(--border)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--text-secondary)' }
+            }, 'Repost'),
+            e('button', {
+              onClick: () => setOpenReplies(prev => ({ ...prev, [item.id]: !prev[item.id] })),
+              className: 'boost-btn',
+              style: { border: '1px solid var(--border)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--text-secondary)' }
+            }, (item.replies && item.replies.length ? item.replies.length + ' Replies' : 'Reply'))
+          )
+        ),
+        item.senderId && item.senderId !== profile.peerId && e('div', { style: { display: 'flex', gap: 8, marginTop: 2 } },
           e('button', {
-            onClick: () => setOpenReplies(prev => ({ ...prev, [item.id]: !prev[item.id] })),
+            onClick: () => hidePost(item.id),
             className: 'boost-btn',
             style: { border: '1px solid var(--border)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--text-secondary)' }
-          }, (item.replies && item.replies.length ? item.replies.length + ' Replies' : 'Reply'))
+          }, 'Hide'),
+          e('button', {
+            onClick: () => toggleMutePeer(item.senderId, !(mutedPeerIds && mutedPeerIds.has(item.senderId))),
+            className: 'boost-btn',
+            style: { border: '1px solid var(--border)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--text-secondary)' }
+          }, (mutedPeerIds && mutedPeerIds.has(item.senderId)) ? 'Unmute' : 'Mute')
+        ),
+        item.senderId === profile.peerId && e('div', { style: { display: 'flex', gap: 8, marginTop: 2 } },
+          e('button', {
+            onClick: () => deletePost(item),
+            className: 'boost-btn',
+            style: { border: '1px solid var(--magenta)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--magenta)' }
+          }, 'Delete')
         ),
         openReplies[item.id] && e('div', { style: { marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 } },
           (item.replies || []).map(r => e('div', {
@@ -2646,6 +2938,31 @@ function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, p
             className: 'boost-btn',
             style: { padding: '8px 14px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--accent)', color: '#fff', fontWeight: 700, fontSize: 12, cursor: 'pointer', opacity: posting ? 0.6 : 1 }
           }, 'Post')
+        )
+      )
+    )
+    ,
+    deleteConfirm && e('div', {
+      onClick: () => setDeleteConfirm(null),
+      style: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }
+    },
+      e('div', {
+        onClick: (ev) => ev.stopPropagation(),
+        style: { width: '100%', maxWidth: 360, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 14, padding: 16, boxShadow: 'var(--shadow-strong)' }
+      },
+        e('div', { style: { fontSize: 14, fontWeight: 700, marginBottom: 6, color: 'var(--text-primary)' } }, deleteConfirm.title),
+        e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 } }, deleteConfirm.message),
+        e('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+          e('button', {
+            onClick: () => setDeleteConfirm(null),
+            className: 'boost-btn',
+            style: { border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-secondary)', borderRadius: 8, padding: '6px 10px', fontSize: 12, cursor: 'pointer' }
+          }, 'Cancel'),
+          e('button', {
+            onClick: () => { deleteConfirm.onConfirm && deleteConfirm.onConfirm(); setDeleteConfirm(null); },
+            className: 'boost-btn',
+            style: { border: '1px solid var(--magenta)', background: 'var(--magenta)', color: '#fff', borderRadius: 8, padding: '6px 10px', fontSize: 12, cursor: 'pointer', fontWeight: 700 }
+          }, 'Delete')
         )
       )
     )
@@ -3451,7 +3768,7 @@ function GeochatView({ position, geochatMessages, setGeochatMessages, profile, s
 
 // ========================== SETTINGS VIEW ==========================
 
-function SettingsView({ profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, peers, setPeers, categories, runDailyBackup }) {
+function SettingsView({ profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, hiddenPosts, setHiddenPosts, peers, setPeers, categories, runDailyBackup }) {
   const [section, setSection] = useState(null);
   const [showQR, setShowQR] = useState(false);
   const [newBlipType, setNewBlipType] = useState({ label: '', icon: '', color: 'var(--accent)' });
@@ -3614,7 +3931,12 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         return Array.from(map.values());
       });
     }
+    if (Array.isArray(imported.hiddenPosts)) {
+      setHiddenPosts(imported.hiddenPosts);
+    }
   }
+
+  const mutedPeers = (peers || []).filter(p => p.muted);
 
   async function chooseBackupFolder() {
     if (!window.showDirectoryPicker) {
@@ -4026,6 +4348,7 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
               posts,
               geoPosts,
               activity,
+              hiddenPosts,
             }, null, 2);
             const blob = new Blob([data], { type: 'application/json' });
             if (navigator.msSaveOrOpenBlob) {
@@ -4111,6 +4434,13 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         }, 'Clean Mixed Posts'),
         e('button', {
           onClick: () => {
+            setHiddenPosts([]);
+            showToast('Hidden posts cleared', 'var(--neon-green)');
+          },
+          className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
+        }, 'Clear Hidden Posts'),
+        e('button', {
+          onClick: () => {
             if (confirm('Clear ALL data? This cannot be undone.')) {
               localStorage.clear();
               window.location.reload();
@@ -4119,6 +4449,23 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
           className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--magenta)', color: 'var(--magenta)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
         }, '🧹 Clear All Data'),
       ),
+    ),
+
+    // Muted peers
+    e('div', { style: sectionStyle },
+      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, 'Muted Peers'),
+      mutedPeers.length === 0 && e('div', { style: { fontSize: 12, color: 'var(--text-secondary)' } }, 'No muted peers.'),
+      mutedPeers.map(p => e('div', {
+        key: p.peerId,
+        style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 10px', background: 'var(--bg-deep)', border: '1px solid var(--border)', borderRadius: 10, marginBottom: 6 }
+      },
+        e('div', { style: { fontSize: 12, color: 'var(--text-primary)' } }, p.displayName || p.peerId),
+        e('button', {
+          onClick: () => setPeers(prev => prev.map(x => x.peerId === p.peerId ? { ...x, muted: false } : x)),
+          className: 'boost-btn',
+          style: { padding: '6px 10px', borderRadius: 8, background: 'transparent', border: '1px solid var(--border)', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer' }
+        }, 'Unmute')
+      ))
     ),
 
     // Backups

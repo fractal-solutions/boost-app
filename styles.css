@@ -566,6 +566,34 @@ input, textarea, select {
   transition: all 0.3s ease;
 }
 
+.tab-label {
+  position: relative;
+  display: inline-block;
+  padding-right: 10px;
+}
+
+.tab-dot {
+  position: absolute;
+  top: -2px;
+  right: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 10px rgba(75, 212, 255, 0.9);
+  animation: pulse-dot 1.8s ease-in-out infinite;
+}
+
+.tab-dot-amber {
+  background: var(--amber);
+  box-shadow: 0 0 10px rgba(255, 190, 85, 0.9);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { transform: scale(1); opacity: 0.9; }
+  50% { transform: scale(1.5); opacity: 0.4; }
+}
+
 input:focus, textarea:focus, select:focus {
   outline: none;
   border-color: var(--accent) !important;
