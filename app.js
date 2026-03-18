@@ -73,6 +73,11 @@ function slugify(value) {
     .replace(/^_+|_+$/g, '');
 }
 
+function formatStatus(status) {
+  if (!status) return 'Available';
+  return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
 function stableStringify(obj) {
   if (obj === null || obj === undefined) return '';
   if (typeof obj !== 'object') return JSON.stringify(obj);
@@ -81,6 +86,11 @@ function stableStringify(obj) {
   return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
 }
 
+const STATUS_OPTIONS = [
+  { value: 'available', label: 'Available' },
+  { value: 'driving', label: 'Driving' },
+  { value: 'offline', label: 'Offline' },
+];
 
 function colorFromId(id) {
   let hash = 0;
@@ -497,6 +507,18 @@ function QRScannerModal({ onScan, onClose }) {
     return () => stopCamera();
   }, []);
 
+  useEffect(() => {
+    const handler = () => {
+      sendToAllPeers({ type: 'status_update', status: currentStatus(), lastActive: Date.now() });
+    };
+    document.addEventListener('visibilitychange', handler);
+    return () => document.removeEventListener('visibilitychange', handler);
+  }, [profile.status]);
+
+  useEffect(() => {
+    sendToAllPeers({ type: 'status_update', status: currentStatus(), lastActive: Date.now() });
+  }, [profile.status]);
+
   async function startCamera() {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -583,7 +605,7 @@ function QRScannerModal({ onScan, onClose }) {
           }
         }),
         e('div', { style: { position: 'absolute', bottom: 10, left: 0, right: 0, textAlign: 'center', fontSize: 12, color: 'var(--text-secondary)' } },
-          'QR scanning requires a QR library - use manual entry below'
+          'Align the QR code inside the frame'
         ),
       ),
 
@@ -827,7 +849,7 @@ function App() {
   const activityKey = storageKey('activity', deviceId);
   const postsKey = storageKey('posts', deviceId);
   const geoPostsKey = storageKey('geo_posts', deviceId);
-  const [profile, setProfile] = useState(() => loadStorage('boost_profile', { displayName: 'Anonymous', peerId: generatePeerId(), avatar: '🙂', createdAt: Date.now() }));
+  const [profile, setProfile] = useState(() => loadStorage('boost_profile', { displayName: 'Anonymous', peerId: generatePeerId(), avatar: '🙂', status: 'available', createdAt: Date.now() }));
   const [settings, setSettings] = useState(() => {
     const stored = loadStorageWithMigration(deviceId, 'settings', DEFAULT_SETTINGS);
     return {
@@ -881,6 +903,8 @@ function App() {
   const [swUpdateReady, setSwUpdateReady] = useState(false);
   const [signReady, setSignReady] = useState(false);
   const lastNonActivityTabRef = useRef('map');
+  const [seenConnections, setSeenConnections] = useState(() => loadStorageWithMigration(deviceId, 'peer_connect_seen', []));
+  const seenConnectionsRef = useRef(new Set());
 
   const peerRef = useRef(null);
   const connectionsRef = useRef({});
@@ -930,6 +954,10 @@ function App() {
   useEffect(() => { saveStorage(outboxKey, outbox); }, [outbox]);
   useEffect(() => { saveStorage(activityKey, activity); }, [activity]);
   useEffect(() => { saveStorage(storageKey('hidden_posts', deviceId), hiddenPosts); }, [hiddenPosts]);
+  useEffect(() => {
+    seenConnectionsRef.current = new Set(seenConnections || []);
+    saveStorage(storageKey('peer_connect_seen', deviceId), seenConnections || []);
+  }, [seenConnections]);
   useEffect(() => { postsRef.current = posts; }, [posts]);
   useEffect(() => { geoPostsRef.current = geoPosts; }, [geoPosts]);
   useEffect(() => {
@@ -953,10 +981,12 @@ function App() {
         setConnectionStatus('connecting');
       }
       flushOutbox();
+      sendToAllPeers({ type: 'status_update', status: currentStatus(), lastActive: Date.now() });
     }
     function handleOffline() {
       setNetworkOnline(false);
       setConnectionStatus('disconnected');
+      sendToAllPeers({ type: 'status_update', status: 'offline', lastActive: Date.now() });
     }
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
@@ -1258,9 +1288,11 @@ function App() {
         }
         return [...prev, { peerId, displayName: peerId, lastSeen: Date.now(), connected: true }];
       });
-      logActivity({ type: 'connect', title: 'Peer connected', peerId });
+      if (shouldLogFirstConnect(peerId)) {
+        logActivity({ type: 'connect', title: 'Peer connected', peerId });
+      }
       // Send introduction
-      conn.send({ type: 'intro', displayName: profile.displayName, avatar: profile.avatar, signPub: localSignKeyRef.current.pubJwk || null });
+      conn.send({ type: 'intro', displayName: profile.displayName, avatar: profile.avatar, status: currentStatus(), lastActive: Date.now(), signPub: localSignKeyRef.current.pubJwk || null });
       if (localKeyRef.current.pubJwk) {
         conn.send({ type: 'key_exchange', pub: localKeyRef.current.pubJwk });
       }
@@ -1307,6 +1339,20 @@ function App() {
     }
   }
 
+  function currentStatus() {
+    if (!navigator.onLine) return 'offline';
+    if (document.visibilityState === 'hidden') return 'offline';
+    return profile.status || 'available';
+  }
+
+  function shouldLogFirstConnect(peerId) {
+    if (!peerId) return false;
+    if (seenConnectionsRef.current.has(peerId)) return false;
+    seenConnectionsRef.current.add(peerId);
+    setSeenConnections(prev => prev.includes(peerId) ? prev : [...prev, peerId]);
+    return true;
+  }
+
   function updatePostById(setter, postId, updater) {
     if (!postId) return;
     setter(prev => {
@@ -1343,7 +1389,10 @@ function App() {
         if (data.signPub) {
           peerSignPubRef.current[fromPeer] = data.signPub;
         }
-        setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, displayName: data.displayName || fromPeer, avatar: data.avatar, signPub: data.signPub || p.signPub } : p));
+        setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, displayName: data.displayName || fromPeer, avatar: data.avatar, status: data.status || p.status, lastActive: data.lastActive || p.lastActive, signPub: data.signPub || p.signPub } : p));
+        break;
+      case 'status_update':
+        updatePeer(fromPeer, { status: data.status || 'available', lastActive: data.lastActive || Date.now() });
         break;
       case 'sign_pub':
         if (data.pub) {
@@ -1580,7 +1629,7 @@ function App() {
   }
 
   function touchPeer(peerId) {
-    updatePeer(peerId, { lastSeen: Date.now(), connected: true });
+    updatePeer(peerId, { lastSeen: Date.now(), lastActive: Date.now(), connected: true });
   }
 
   const flushOutbox = useCallback((targetPeerId) => {
@@ -2187,7 +2236,9 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
                 lastMsg && e('span', { style: { fontSize: 10, color: 'var(--text-secondary)' } }, timeAgo(lastMsg.timestamp)),
               ),
               e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 3, gap: 8 } },
-                e('span', { style: { fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 } }, lastMsg ? lastMsg.text : (peer.connected ? 'Connected' : 'Offline')) ,
+                e('span', { style: { fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 } },
+                  lastMsg ? lastMsg.text : (peer.connected ? (formatStatus(peer.status) || 'Available') : ('Last active ' + timeAgo(peer.lastActive || peer.lastSeen || Date.now())))
+                ) ,
                 e('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 } },
                   incomingShare && e('span', { style: { background: 'var(--amber)', color: '#1b1410', fontSize: 9, fontWeight: 800, borderRadius: 999, padding: '2px 6px', letterSpacing: 0.4 } }, 'Wants to share'),
                   e('button', {
@@ -4140,6 +4191,16 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
           key: av, onClick: () => setProfile(p => ({ ...p, avatar: av })),
           style: { fontSize: 22, padding: '4px 8px', background: profile.avatar === av ? 'var(--bg-card2)' : 'transparent', border: profile.avatar === av ? '1px solid var(--accent)' : '1px solid transparent', borderRadius: 8, cursor: 'pointer' }
         }, av))
+      ),
+      e('div', { style: { marginBottom: 12 } },
+        e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 } }, 'Status'),
+        e('select', {
+          value: profile.status || 'available',
+          onChange: (ev) => setProfile(p => ({ ...p, status: ev.target.value })),
+          style: { ...inputStyle, marginBottom: 0 }
+        },
+          STATUS_OPTIONS.map(opt => e('option', { key: opt.value, value: opt.value }, opt.label))
+        )
       ),
       // QR & Share section
       e('div', { style: { borderTop: '1px solid var(--border)', paddingTop: 12 } },
