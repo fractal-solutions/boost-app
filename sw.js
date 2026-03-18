@@ -8,6 +8,7 @@ const PRECACHE_URLS = [
   './icons/icon-192.png',
   './icons/icon-512.png',
 ];
+const NETWORK_FIRST = ['/app.js', '/styles.css', '/index.html', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -42,6 +43,16 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(req.url);
   if (url.origin === self.location.origin) {
+    if (NETWORK_FIRST.some(path => url.pathname.endsWith(path))) {
+      event.respondWith(
+        fetch(req).then((res) => {
+          const copy = res.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(req, copy));
+          return res;
+        }).catch(() => caches.match(req))
+      );
+      return;
+    }
     event.respondWith(
       caches.match(req).then((cached) =>
         cached || fetch(req).then((res) => {

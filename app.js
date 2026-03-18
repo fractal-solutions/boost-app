@@ -7,6 +7,7 @@ const OUTBOX_RETRY_MS = 5000;
 const PING_INTERVAL_MS = 7000;
 const PONG_TIMEOUT_MS = 18000;
 const ACTIVITY_MAX = 200;
+const LOC_STALE_MS = 20000;
 
 function generateId(prefix = '') {
   return prefix + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
@@ -804,6 +805,8 @@ function App() {
   const geochatKey = storageKey('geochat', deviceId);
   const outboxKey = storageKey('outbox', deviceId);
   const activityKey = storageKey('activity', deviceId);
+  const postsKey = storageKey('posts', deviceId);
+  const geoPostsKey = storageKey('geo_posts', deviceId);
   const [profile, setProfile] = useState(() => loadStorage('boost_profile', { displayName: 'Anonymous', peerId: generatePeerId(), avatar: '🙂', createdAt: Date.now() }));
   const [settings, setSettings] = useState(() => {
     const stored = loadStorageWithMigration(deviceId, 'settings', DEFAULT_SETTINGS);
@@ -831,6 +834,14 @@ function App() {
     return stored.filter(m => Date.now() - m.timestamp < 86400000);
   });
   const [activity, setActivity] = useState(() => loadStorageWithMigration(deviceId, 'activity', []));
+  const [posts, setPosts] = useState(() => {
+    const stored = loadStorageWithMigration(deviceId, 'posts', []);
+    return stored.filter(p => !p.expiresAt || p.expiresAt > Date.now());
+  });
+  const [geoPosts, setGeoPosts] = useState(() => {
+    const stored = loadStorageWithMigration(deviceId, 'geo_posts', []);
+    return stored.filter(p => !p.expiresAt || p.expiresAt > Date.now());
+  });
   const [lastBackupAt, setLastBackupAt] = useState(() => loadStorage('boost_last_backup_at', 0));
   const [position, setPosition] = useState(null);
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
@@ -843,6 +854,8 @@ function App() {
   const connectionsRef = useRef({});
   const peerHealthRef = useRef({});
   const peersRef = useRef([]);
+  const postsRef = useRef([]);
+  const geoPostsRef = useRef([]);
   const peerKeysRef = useRef({});
   const peerPubRef = useRef({});
   const localKeyRef = useRef({ pair: null, pubJwk: null });
@@ -873,6 +886,10 @@ function App() {
   useEffect(() => { saveStorage(geochatKey, geochatMessages); }, [geochatMessages]);
   useEffect(() => { saveStorage(outboxKey, outbox); }, [outbox]);
   useEffect(() => { saveStorage(activityKey, activity); }, [activity]);
+  useEffect(() => { postsRef.current = posts; }, [posts]);
+  useEffect(() => { geoPostsRef.current = geoPosts; }, [geoPosts]);
+  useEffect(() => { saveStorage(postsKey, posts); }, [posts]);
+  useEffect(() => { saveStorage(geoPostsKey, geoPosts); }, [geoPosts]);
 
   useEffect(() => {
     function handleOnline() {
@@ -1103,6 +1120,12 @@ function App() {
       myBlips.forEach(b => {
         conn.send({ type: 'blip', blip: b });
       });
+      // Sync recent posts to new peer
+      const now = Date.now();
+      const recentPosts = (postsRef.current || []).filter(p => p.senderId === profile.peerId && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      recentPosts.forEach(p => { sendToPeer(peerId, { type: 'post', post: p }); });
+      const recentGeo = (geoPostsRef.current || []).filter(p => p.senderId === profile.peerId && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      recentGeo.forEach(p => { sendToPeer(peerId, { type: 'geofeed_post', post: p }); });
       flushOutbox(peerId);
     });
 
@@ -1133,6 +1156,19 @@ function App() {
     } catch (err) {
       showToast('Connection failed', 'var(--magenta)');
     }
+  }
+
+  function updatePostById(setter, postId, updater) {
+    if (!postId) return;
+    setter(prev => {
+      let changed = false;
+      const next = prev.map(p => {
+        if (p.id !== postId) return p;
+        changed = true;
+        return updater(p);
+      });
+      return changed ? next : prev;
+    });
   }
 
   async function handlePeerData(fromPeer, data) {
@@ -1265,6 +1301,38 @@ function App() {
         showToast((data.senderName || fromPeer) + ' buzzed you', 'var(--amber)');
         logActivity({ type: 'buzz', title: 'Buzz', peerId: fromPeer });
         break;
+      case 'post':
+        if (data.post && (!data.post.expiresAt || data.post.expiresAt > Date.now())) {
+          setPosts(prev => [data.post, ...prev].slice(0, 200));
+        }
+        break;
+      case 'geofeed_post':
+        if (data.post && (!data.post.expiresAt || data.post.expiresAt > Date.now())) {
+          setGeoPosts(prev => [data.post, ...prev].slice(0, 200));
+        }
+        break;
+      case 'post_reaction':
+        if (data.postId && data.reaction) {
+          const updater = (p) => {
+            const reactions = { ...(p.reactions || {}) };
+            reactions[data.reaction] = (reactions[data.reaction] || 0) + 1;
+            return { ...p, reactions };
+          };
+          if (data.feed === 'geofeed') updatePostById(setGeoPosts, data.postId, updater);
+          else updatePostById(setPosts, data.postId, updater);
+        }
+        break;
+      case 'post_reply':
+        if (data.postId && data.reply) {
+          const updater = (p) => {
+            const replies = p.replies || [];
+            if (replies.find(r => r.id === data.reply.id)) return p;
+            return { ...p, replies: [...replies, data.reply] };
+          };
+          if (data.feed === 'geofeed') updatePostById(setGeoPosts, data.postId, updater);
+          else updatePostById(setPosts, data.postId, updater);
+        }
+        break;
       case 'ping':
         if (connectionsRef.current[fromPeer]) {
           connectionsRef.current[fromPeer].send({ type: 'pong' });
@@ -1389,6 +1457,9 @@ function App() {
       messages,
       blips,
       geochatMessages,
+      posts,
+      geoPosts,
+      activity,
     };
   }
 
@@ -1527,13 +1598,21 @@ function App() {
       if (timeoutId) clearTimeout(timeoutId);
       if (intervalId) clearInterval(intervalId);
     };
-  }, [settings.backup && settings.backup.enabled, settings.backup && settings.backup.name, profile.displayName, profile.peerId, blips, peers, messages, geochatMessages, settings, lastBackupAt]);
+  }, [settings.backup && settings.backup.enabled, settings.backup && settings.backup.name, profile.displayName, profile.peerId, blips, peers, messages, geochatMessages, posts, geoPosts, activity, settings, lastBackupAt]);
 
   // Blip expiry check
   useEffect(() => {
     const interval = setInterval(() => {
       setBlips(prev => prev.filter(b => !b.expiresAt || b.expiresAt > Date.now()));
     }, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setPosts(prev => prev.filter(p => !p.expiresAt || p.expiresAt > Date.now()));
+      setGeoPosts(prev => prev.filter(p => !p.expiresAt || p.expiresAt > Date.now()));
+    }, 60000);
     return () => clearInterval(interval);
   }, []);
 
@@ -1547,9 +1626,10 @@ function App() {
     e('div', { style: { flex: 1, overflow: 'hidden', position: 'relative' } },
       activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
       activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories: allCategories, logActivity }),
-      activeTab === 'activity' && e(ActivityView, { activity, peers }),
+      activeTab === 'feed' && e(FeedView, { position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings }),
       activeTab === 'geochat' && e(GeochatView, { position, geochatMessages, setGeochatMessages, profile, sendToAllPeers, settings }),
-      activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, peers, setPeers, categories: allCategories, runDailyBackup }),
+      activeTab === 'activity' && e(ActivityView, { activity, peers }),
+      activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, peers, setPeers, categories: allCategories, runDailyBackup }),
     ),
     // Bottom nav
     e(BottomNav, { activeTab, setActiveTab, unreadCounts })
@@ -1607,6 +1687,7 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
   const tabs = [
     { id: 'chat', label: 'Chat' },
     { id: 'map', label: 'Map' },
+    { id: 'feed', label: 'Feed' },
     { id: 'geochat', label: 'Geochat' },
     { id: 'activity', label: 'Activity' },
     { id: 'settings', label: 'Settings' },
@@ -2101,6 +2182,309 @@ function ActivityView({ activity, peers }) {
   );
 }
 
+// ========================== FEED VIEW ==========================
+
+function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings }) {
+  const [mode, setMode] = useState('peers');
+  const [text, setText] = useState('');
+  const [imageData, setImageData] = useState('');
+  const [imageName, setImageName] = useState('');
+  const [posting, setPosting] = useState(false);
+  const [showComposer, setShowComposer] = useState(false);
+  const [expiryMs, setExpiryMs] = useState(48 * 60 * 60 * 1000);
+  const [openReplies, setOpenReplies] = useState({});
+  const [replyDrafts, setReplyDrafts] = useState({});
+  const MAX_LEN = 280;
+  const MAX_IMAGE_BYTES = 1500 * 1024;
+  const zoneRadius = settings.geochat.zoneRadius || 1000;
+  const zoneKey = position ? getZoneKey(position.lat, position.lng, zoneRadius) : null;
+  const zoneName = position ? getZoneName(position.lat, position.lng, zoneRadius) : 'Unknown Zone';
+  const peersSet = useMemo(() => new Set((peers || []).map(p => p.peerId)), [peers]);
+
+  const filteredPeersFeed = useMemo(() => {
+    return (posts || []).filter(p => p.senderId === profile.peerId || peersSet.has(p.senderId));
+  }, [posts, peersSet, profile.peerId]);
+
+  const filteredGeoFeed = useMemo(() => {
+    return (geoPosts || []).filter(p => {
+      if (p.senderId === profile.peerId) return true;
+      if (!settings.geochat.enabled) return false;
+      if (!zoneKey) return false;
+      return p.zoneKey === zoneKey;
+    });
+  }, [geoPosts, settings.geochat.enabled, zoneKey, profile.peerId]);
+
+  function handleImage(ev) {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      showToast('Only images supported', 'var(--amber)');
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      showToast('Image too large (max 1.5MB)', 'var(--amber)');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      setImageData(e.target.result || '');
+      setImageName(file.name || 'image');
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function clearImage() {
+    setImageData('');
+    setImageName('');
+  }
+
+  function handlePost() {
+    if (posting) return;
+    const cleanText = text.trim();
+    if (!cleanText && !imageData) {
+      showToast('Write something or add an image', 'var(--amber)');
+      return;
+    }
+    if (mode === 'geofeed') {
+      if (!settings.geochat.enabled) {
+        showToast('Enable Geochat to post to Geofeed', 'var(--magenta)');
+        return;
+      }
+      if (!position) {
+        showToast('Location required for Geofeed', 'var(--magenta)');
+        return;
+      }
+    }
+    setPosting(true);
+    const post = {
+      id: generateId('post'),
+      senderId: profile.peerId,
+      sender: profile.displayName || profile.peerId,
+      text: cleanText.slice(0, MAX_LEN),
+      image: imageData || null,
+      imageName: imageName || null,
+      timestamp: Date.now(),
+      expiresAt: expiryMs === 0 ? null : Date.now() + expiryMs,
+      lat: position ? position.lat : null,
+      lng: position ? position.lng : null,
+      zoneKey: position ? getZoneKey(position.lat, position.lng, zoneRadius) : null,
+      zoneRadius,
+    };
+    if (mode === 'geofeed') {
+      setGeoPosts(prev => [post, ...prev].slice(0, 200));
+      sendReliableToAllPeers({ type: 'geofeed_post', post });
+      showToast('Posted to Geofeed', 'var(--neon-green)');
+    } else {
+      setPosts(prev => [post, ...prev].slice(0, 200));
+      sendReliableToAllPeers({ type: 'post', post });
+      showToast('Posted to Peers', 'var(--neon-green)');
+    }
+    setText('');
+    clearImage();
+    setShowComposer(false);
+    setPosting(false);
+  }
+
+  function addReaction(postId, reaction) {
+    if (!postId || !reaction) return;
+    const updater = (p) => {
+      const reactions = { ...(p.reactions || {}) };
+      reactions[reaction] = (reactions[reaction] || 0) + 1;
+      return { ...p, reactions };
+    };
+    if (mode === 'geofeed') setGeoPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    else setPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    sendReliableToAllPeers({ type: 'post_reaction', feed: mode, postId, reaction });
+  }
+
+  function addReply(postId) {
+    const text = (replyDrafts[postId] || '').trim();
+    if (!text) return;
+    const reply = {
+      id: generateId('reply'),
+      senderId: profile.peerId,
+      sender: profile.displayName || profile.peerId,
+      text: text.slice(0, MAX_LEN),
+      timestamp: Date.now(),
+    };
+    const updater = (p) => {
+      const replies = p.replies || [];
+      return { ...p, replies: [...replies, reply] };
+    };
+    if (mode === 'geofeed') setGeoPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    else setPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    sendReliableToAllPeers({ type: 'post_reply', feed: mode, postId, reply });
+    setReplyDrafts(prev => ({ ...prev, [postId]: '' }));
+    setOpenReplies(prev => ({ ...prev, [postId]: true }));
+  }
+
+  const feedItems = (mode === 'geofeed' ? filteredGeoFeed : filteredPeersFeed).filter(p => !p.expiresAt || p.expiresAt > Date.now());
+
+  return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column', padding: 14, gap: 12, overflow: 'hidden', position: 'relative' } },
+    e('div', { style: { display: 'flex', gap: 8 } },
+      e('button', {
+        onClick: () => setMode('peers'),
+        className: 'boost-btn',
+        style: {
+          flex: 1, padding: '8px 12px', borderRadius: 999, border: '1px solid var(--border)',
+          background: mode === 'peers' ? 'var(--bg-card2)' : 'transparent',
+          color: mode === 'peers' ? 'var(--accent)' : 'var(--text-secondary)', fontWeight: 600, fontSize: 12
+        }
+      }, 'Peers'),
+      e('button', {
+        onClick: () => setMode('geofeed'),
+        className: 'boost-btn',
+        style: {
+          flex: 1, padding: '8px 12px', borderRadius: 999, border: '1px solid var(--border)',
+          background: mode === 'geofeed' ? 'var(--bg-card2)' : 'transparent',
+          color: mode === 'geofeed' ? 'var(--accent)' : 'var(--text-secondary)', fontWeight: 600, fontSize: 12
+        }
+      }, 'Geofeed'),
+    ),
+    e('div', { style: { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, paddingRight: 2 } },
+      feedItems.length === 0 && e('div', { style: { padding: 16, textAlign: 'center', color: 'var(--text-secondary)', fontSize: 12 } },
+        mode === 'geofeed' ? 'No geofeed posts yet.' : 'No peer posts yet.'
+      ),
+      feedItems.map(item => e('div', {
+        key: item.id,
+        style: { background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 16, padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }
+      },
+        e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+          e('div', { style: { fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' } }, item.sender || 'Peer'),
+          e('div', { style: { fontSize: 10, color: 'var(--text-secondary)' } }, timeAgo(item.timestamp))
+        ),
+        item.text && e('div', { style: { fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.4, whiteSpace: 'pre-wrap' } }, item.text),
+        item.image && e('img', { src: item.image, alt: item.imageName || 'post image', style: { width: '100%', maxHeight: 260, objectFit: 'cover', borderRadius: 12, border: '1px solid var(--border)' } }),
+        mode === 'geofeed' && item.zoneKey && e('div', { style: { fontSize: 10, color: 'var(--text-secondary)' } },
+          item.zoneKey === zoneKey ? 'In your zone' : 'Nearby zone'
+        ),
+        e('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+          e('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+            ['👍', '🔥', '😂', '😮', '😢'].map(rx => e('button', {
+              key: rx,
+              onClick: () => addReaction(item.id, rx),
+              className: 'boost-btn',
+              style: { border: '1px solid var(--border)', background: 'var(--bg-card2)', borderRadius: 999, padding: '4px 8px', fontSize: 12, cursor: 'pointer', color: 'var(--text-primary)' }
+            }, rx + (item.reactions && item.reactions[rx] ? ' ' + item.reactions[rx] : '')))
+          ),
+          e('button', {
+            onClick: () => setOpenReplies(prev => ({ ...prev, [item.id]: !prev[item.id] })),
+            className: 'boost-btn',
+            style: { border: '1px solid var(--border)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--text-secondary)' }
+          }, (item.replies && item.replies.length ? item.replies.length + ' Replies' : 'Reply'))
+        ),
+        openReplies[item.id] && e('div', { style: { marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 } },
+          (item.replies || []).map(r => e('div', {
+            key: r.id,
+            style: { borderLeft: '2px solid var(--border)', paddingLeft: 8, fontSize: 12, color: 'var(--text-primary)' }
+          },
+            e('div', { style: { fontWeight: 700, fontSize: 11, marginBottom: 2 } }, r.sender || 'Peer'),
+            e('div', { style: { whiteSpace: 'pre-wrap' } }, r.text),
+            e('div', { style: { fontSize: 9, color: 'var(--text-secondary)', marginTop: 2 } }, timeAgo(r.timestamp))
+          )),
+          e('div', { style: { display: 'flex', gap: 8, marginTop: 4 } },
+            e('input', {
+              value: replyDrafts[item.id] || '',
+              onChange: (ev) => setReplyDrafts(prev => ({ ...prev, [item.id]: ev.target.value })),
+              placeholder: 'Write a reply...',
+              style: { flex: 1, background: 'var(--bg-deep)', border: '1px solid var(--border)', borderRadius: 999, padding: '6px 12px', color: 'var(--text-primary)', fontSize: 12 }
+            }),
+            e('button', {
+              onClick: () => addReply(item.id),
+              className: 'boost-btn',
+              style: { border: '1px solid var(--border)', background: 'var(--accent)', color: '#fff', borderRadius: 999, padding: '6px 12px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }
+            }, 'Send')
+          )
+        )
+      ))
+    ),
+    e('button', {
+      onClick: () => setShowComposer(true),
+      className: 'boost-btn',
+      style: {
+        position: 'absolute', right: 16, bottom: 16, zIndex: 5,
+        background: 'var(--accent)', color: '#fff', border: 'none',
+        borderRadius: 999, padding: '10px 16px', fontWeight: 700, fontSize: 12, cursor: 'pointer',
+        boxShadow: 'var(--shadow-soft)'
+      }
+    }, 'Post'),
+    showComposer && e('div', {
+      onClick: () => setShowComposer(false),
+      style: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 10, display: 'flex', alignItems: 'flex-end', padding: 12 }
+    },
+      e('div', {
+        onClick: (ev) => ev.stopPropagation(),
+        style: {
+          width: '100%', maxHeight: '80%', overflow: 'auto', background: 'var(--bg-card)',
+          border: '1px solid var(--border)', borderRadius: 16, padding: 12, boxShadow: 'var(--shadow-strong)'
+        }
+      },
+        e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 } },
+          e('div', { style: { fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' } }, mode === 'geofeed' ? 'Post to Geofeed' : 'Post to Peers'),
+          e('button', {
+            onClick: () => setShowComposer(false),
+            className: 'boost-btn',
+            style: { background: 'transparent', border: '1px solid var(--border)', borderRadius: 8, padding: '4px 8px', fontSize: 11, color: 'var(--text-secondary)', cursor: 'pointer' }
+          }, 'Close')
+        ),
+        e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 } },
+          mode === 'geofeed'
+            ? ('Posting to ' + zoneName + ' · ' + (zoneRadius >= 1000 ? (zoneRadius / 1000) + 'km' : zoneRadius + 'm'))
+            : 'Posting to your peers'
+        ),
+        e('textarea', {
+          value: text,
+          onChange: (ev) => setText(ev.target.value.slice(0, MAX_LEN)),
+          placeholder: mode === 'geofeed' ? 'Share something for your zone...' : 'Share something with your peers...',
+          style: {
+            width: '100%', minHeight: 90, resize: 'none', borderRadius: 12, border: '1px solid var(--border)',
+            background: 'var(--bg-deep)', color: 'var(--text-primary)', padding: 10, fontSize: 13, outline: 'none'
+          }
+        }),
+        e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 } },
+          e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, (text.length || 0) + '/' + MAX_LEN),
+          e('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, 'Expires'),
+            e('select', {
+              value: String(expiryMs),
+              onChange: (ev) => setExpiryMs(parseInt(ev.target.value)),
+              style: { background: 'var(--bg-deep)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: 8, padding: '4px 8px', fontSize: 11 }
+            },
+              e('option', { value: String(6 * 60 * 60 * 1000) }, '6h'),
+              e('option', { value: String(12 * 60 * 60 * 1000) }, '12h'),
+              e('option', { value: String(24 * 60 * 60 * 1000) }, '24h'),
+              e('option', { value: String(48 * 60 * 60 * 1000) }, '48h'),
+              e('option', { value: String(7 * 24 * 60 * 60 * 1000) }, '7d'),
+              e('option', { value: '0' }, 'Never')
+            )
+          )
+        ),
+        imageData && e('div', { style: { marginTop: 10, position: 'relative' } },
+          e('img', { src: imageData, alt: imageName || 'post image', style: { width: '100%', maxHeight: 220, objectFit: 'cover', borderRadius: 12, border: '1px solid var(--border)' } }),
+          e('button', {
+            onClick: clearImage,
+            className: 'boost-btn',
+            style: { position: 'absolute', top: 8, right: 8, background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none', borderRadius: 8, padding: '4px 8px', fontSize: 11, cursor: 'pointer' }
+          }, 'Remove')
+        ),
+        e('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' } },
+          e('label', { className: 'boost-btn', style: { padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 12, background: 'var(--bg-card2)' } },
+            'Add Image',
+            e('input', { type: 'file', accept: 'image/*', onChange: handleImage, style: { display: 'none' } })
+          ),
+          imageName && e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 140 } }, imageName),
+          e('div', { style: { flex: 1 } }),
+          e('button', {
+            onClick: handlePost,
+            className: 'boost-btn',
+            style: { padding: '8px 14px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--accent)', color: '#fff', fontWeight: 700, fontSize: 12, cursor: 'pointer', opacity: posting ? 0.6 : 1 }
+          }, 'Post')
+        )
+      )
+    )
+  );
+}
+
 // ========================== MAP VIEW ==========================
 
 function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories, logActivity }) {
@@ -2111,6 +2495,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const blipMarkersRef = useRef({});
   const peerLayerRef = useRef(null);
   const peerMarkersRef = useRef({});
+  const peerBadgesRef = useRef({});
   const routeLayerRef = useRef(null);
   const routeAbortRef = useRef(null);
   const lastRouteKeyRef = useRef(null);
@@ -2358,7 +2743,17 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       activeIds.add(p.peerId);
       const color = colorFromId(p.peerId);
       const target = L.latLng(p.lastLoc.lat, p.lastLoc.lng);
+      const lastSeen = p.lastSeen || 0;
+      const lastLocAt = p.lastLocAt || 0;
+      const locStale = lastLocAt && (Date.now() - lastLocAt > LOC_STALE_MS);
+      const name = p.displayName || p.peerId;
+      const tooltipHtml = [
+        '<div style="font-weight:700;font-size:12px;margin-bottom:2px;">' + name + '</div>',
+        '<div style="font-size:10px;opacity:0.8;">Seen ' + (lastSeen ? timeAgo(lastSeen) : 'unknown') + '</div>',
+        '<div style="font-size:10px;opacity:0.8;">Location ' + (lastLocAt ? timeAgo(lastLocAt) : 'unknown') + (locStale ? ' · stale' : ' · live') + '</div>',
+      ].join('');
       let marker = markers[p.peerId];
+      let badge = peerBadgesRef.current[p.peerId];
       if (!marker) {
         marker = L.circleMarker(target, {
           radius: 8,
@@ -2367,21 +2762,39 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
           fillColor: color,
           fillOpacity: 0.6,
         });
-        marker.bindTooltip(p.displayName || p.peerId, { direction: 'top', offset: [0, -8], opacity: 0.9 });
+        marker.bindTooltip(tooltipHtml, { direction: 'top', offset: [0, -8], opacity: 0.95 });
         marker.addTo(layer);
         markers[p.peerId] = marker;
       } else {
         const from = marker.getLatLng();
         animateMarker(marker, from, target);
       }
-      marker.setStyle({ color, fillColor: color });
-      marker.setTooltipContent(p.displayName || p.peerId);
+      if (!badge) {
+        const html = '<div class="peer-update-badge' + (locStale ? ' stale' : '') + '">' + (lastLocAt ? timeAgo(lastLocAt) : 'unknown') + '</div>';
+        badge = L.marker(target, {
+          interactive: false,
+          icon: L.divIcon({ className: 'peer-update-badge-wrap', html })
+        }).addTo(layer);
+        peerBadgesRef.current[p.peerId] = badge;
+      } else {
+        badge.setLatLng(target);
+        const html = '<div class="peer-update-badge' + (locStale ? ' stale' : '') + '">' + (lastLocAt ? timeAgo(lastLocAt) : 'unknown') + '</div>';
+        badge.setIcon(L.divIcon({ className: 'peer-update-badge-wrap', html }));
+      }
+      marker.setStyle({ color, fillColor: color, fillOpacity: locStale ? 0.2 : 0.6, opacity: locStale ? 0.6 : 1, weight: locStale ? 1 : 2 });
+      marker.setTooltipContent(tooltipHtml);
     });
 
     Object.keys(markers).forEach(pid => {
       if (!activeIds.has(pid)) {
         layer.removeLayer(markers[pid]);
         delete markers[pid];
+      }
+    });
+    Object.keys(peerBadgesRef.current).forEach(pid => {
+      if (!activeIds.has(pid)) {
+        layer.removeLayer(peerBadgesRef.current[pid]);
+        delete peerBadgesRef.current[pid];
       }
     });
   }, [peers]);
@@ -2871,7 +3284,7 @@ function GeochatView({ position, geochatMessages, setGeochatMessages, profile, s
 
 // ========================== SETTINGS VIEW ==========================
 
-function SettingsView({ profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, peers, setPeers, categories, runDailyBackup }) {
+function SettingsView({ profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, peers, setPeers, categories, runDailyBackup }) {
   const [section, setSection] = useState(null);
   const [showQR, setShowQR] = useState(false);
   const [newBlipType, setNewBlipType] = useState({ label: '', icon: '', color: 'var(--accent)' });
@@ -3000,6 +3413,36 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         imported.geochatMessages.forEach(m => {
           if (!m || !m.id) return;
           map.set(m.id, map.get(m.id) || m);
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (Array.isArray(imported.posts)) {
+      setPosts(prev => {
+        const map = new Map(prev.map(p => [p.id, p]));
+        imported.posts.forEach(p => {
+          if (!p || !p.id) return;
+          map.set(p.id, map.get(p.id) || p);
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (Array.isArray(imported.geoPosts)) {
+      setGeoPosts(prev => {
+        const map = new Map(prev.map(p => [p.id, p]));
+        imported.geoPosts.forEach(p => {
+          if (!p || !p.id) return;
+          map.set(p.id, map.get(p.id) || p);
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (Array.isArray(imported.activity)) {
+      setActivity(prev => {
+        const map = new Map(prev.map(a => [a.id, a]));
+        imported.activity.forEach(a => {
+          if (!a || !a.id) return;
+          map.set(a.id, map.get(a.id) || a);
         });
         return Array.from(map.values());
       });
@@ -3413,6 +3856,9 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
               messages,
               blips,
               geochatMessages,
+              posts,
+              geoPosts,
+              activity,
             }, null, 2);
             const blob = new Blob([data], { type: 'application/json' });
             if (navigator.msSaveOrOpenBlob) {
