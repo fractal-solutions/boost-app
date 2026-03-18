@@ -107,6 +107,7 @@ function loadStorageWithMigration(deviceId, base, def) {
 
 const IDB_NAME = 'boost_db';
 const IDB_STORE = 'handles';
+const FALLBACK_BACKUP_KEY = 'boost_backup_fallback';
 
 function idbOpen() {
   return new Promise((resolve, reject) => {
@@ -176,6 +177,32 @@ async function writeBackupToFolder(payload, name, interactive = false) {
   } catch {
     return false;
   }
+}
+
+function writeBackupFallback(payload) {
+  try {
+    localStorage.setItem(FALLBACK_BACKUP_KEY, JSON.stringify(payload));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readBackupFallback() {
+  try {
+    const raw = localStorage.getItem(FALLBACK_BACKUP_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function msUntilNext3am() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(3, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return next.getTime() - now.getTime();
 }
 
 function urlBase64ToUint8Array(base64String) {
@@ -809,7 +836,11 @@ function App() {
   useEffect(() => {
     const theme = (settings.ui && settings.ui.theme) || 'obsidian';
     const root = document.body;
-    root.classList.remove('theme-obsidian', 'theme-slate', 'theme-ivory');
+    root.classList.remove(
+      'theme-onyx', 'theme-paper',
+      'theme-dusk', 'theme-neon', 'theme-pastel', 'theme-sunset', 'theme-ocean', 'theme-rose',
+      'theme-matcha', 'theme-lavender', 'theme-desert', 'theme-mono', 'theme-ivory'
+    );
     root.classList.add('theme-' + theme);
   }, [settings.ui && settings.ui.theme]);
 
@@ -1234,18 +1265,23 @@ function App() {
   }
 
   async function runDailyBackup(force = false, interactive = false) {
-    if (!settings.backup || !settings.backup.enabled) return;
+    const backupEnabled = !!(settings.backup && settings.backup.enabled);
+    if (!backupEnabled && !force) return;
     const todayKey = new Date().toISOString().slice(0, 10);
     const lastKey = lastBackupAt ? new Date(lastBackupAt).toISOString().slice(0, 10) : null;
     if (!force && lastKey === todayKey) return;
     const name = settings.backup.name || profile.displayName || profile.peerId || 'user';
-    const ok = await writeBackupToFolder(buildBackupPayload(), name, interactive);
-    if (ok) {
+    const payload = buildBackupPayload();
+    const folderOk = await writeBackupToFolder(payload, name, interactive);
+    const fallbackOk = writeBackupFallback(payload);
+    if (folderOk || fallbackOk) {
       setLastBackupAt(Date.now());
-      if (interactive) showToast('Backup saved', 'var(--neon-green)');
-    } else if (interactive) {
-      showToast('Backup folder not set', 'var(--amber)');
+      if (interactive) {
+        showToast(folderOk ? 'Backup saved' : 'Backup saved (in-app)', 'var(--neon-green)');
+      }
+      return;
     }
+    if (interactive) showToast('Backup failed', 'var(--magenta)');
   }
 
   async function buzzPeer(peerId) {
@@ -1348,9 +1384,20 @@ function App() {
   }, [flushOutbox]);
 
   useEffect(() => {
-    runDailyBackup(false, false);
-    const interval = setInterval(() => { runDailyBackup(false, false); }, 60 * 60 * 1000);
-    return () => clearInterval(interval);
+    if (!settings.backup || !settings.backup.enabled) return;
+    let timeoutId = null;
+    let intervalId = null;
+    const schedule = () => {
+      timeoutId = setTimeout(() => {
+        runDailyBackup(false, false);
+        intervalId = setInterval(() => { runDailyBackup(false, false); }, 24 * 60 * 60 * 1000);
+      }, msUntilNext3am());
+    };
+    schedule();
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (intervalId) clearInterval(intervalId);
+    };
   }, [settings.backup && settings.backup.enabled, settings.backup && settings.backup.name, profile.displayName, profile.peerId, blips, peers, messages, geochatMessages, settings, lastBackupAt]);
 
   // Blip expiry check
@@ -1890,7 +1937,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     L.control.zoom({ position: 'bottomleft' }).addTo(map);
 
     const theme = (settings.ui && settings.ui.theme) || 'obsidian';
-    const lightThemes = ['ivory', 'sand'];
+    const lightThemes = ['paper', 'pastel', 'desert', 'ivory'];
     const tileUrl = lightThemes.includes(theme)
       ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
       : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
@@ -1910,7 +1957,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   useEffect(() => {
     if (!leafletMapRef.current) return;
     const theme = (settings.ui && settings.ui.theme) || 'obsidian';
-    const lightThemes = ['ivory', 'sand'];
+    const lightThemes = ['paper', 'pastel', 'desert', 'ivory'];
     const tileUrl = lightThemes.includes(theme)
       ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
       : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
@@ -2533,6 +2580,21 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
     { label: 'Ruby Red', value: '#FF0000' },
     { label: 'Slate', value: '#94A3B8' },
   ];
+  const themeOptions = [
+    { id: 'onyx', label: 'Onyx', swatches: ['#05070c', '#101622', '#78c5ff'] },
+    { id: 'paper', label: 'Paper', swatches: ['#f7f8fb', '#ffffff', '#2a5bd7'] },
+    { id: 'dusk', label: 'Dusk', swatches: ['#1b1428', '#2a2140', '#b58cff'] },
+    { id: 'neon', label: 'Neon', swatches: ['#070a12', '#182236', '#00f0ff'] },
+    { id: 'pastel', label: 'Pastel', swatches: ['#f7f3f6', '#ffffff', '#7b9cff'] },
+    { id: 'sunset', label: 'Sunset', swatches: ['#1b1216', '#2d2224', '#ff8a3d'] },
+    { id: 'ocean', label: 'Ocean', swatches: ['#0c1b22', '#1a2f39', '#2dd4bf'] },
+    { id: 'rose', label: 'Rose', swatches: ['#1b1218', '#2b2029', '#ff7a9e'] },
+    { id: 'matcha', label: 'Matcha', swatches: ['#17221b', '#223028', '#7bd389'] },
+    { id: 'lavender', label: 'Lavender', swatches: ['#1b162a', '#2b2341', '#c2a0ff'] },
+    { id: 'desert', label: 'Desert', swatches: ['#f6efe5', '#fff7ee', '#c16a2f'] },
+    { id: 'ivory', label: 'Ivory', swatches: ['#f7f6f2', '#ffffff', '#1e4bd6'] },
+    { id: 'mono', label: 'Mono', swatches: ['#0d0f12', '#1f242c', '#cfd5dd'] },
+  ];
 
   function updateSettings(path, value) {
     setSettings(prev => {
@@ -2560,6 +2622,82 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
     }
   }
 
+  function importBackupData(imported) {
+    if (!imported || typeof imported !== 'object') throw new Error('Invalid');
+    if (imported.profile) {
+      setProfile(p => ({
+        ...p,
+        displayName: imported.profile.displayName || p.displayName,
+        avatar: imported.profile.avatar || p.avatar,
+        createdAt: imported.profile.createdAt || p.createdAt,
+      }));
+    }
+    if (imported.settings) {
+      setSettings(prev => ({
+        ...prev,
+        ...imported.settings,
+        peerServer: { ...DEFAULT_SETTINGS.peerServer, ...(imported.settings.peerServer || {}) },
+        iceServers: { ...DEFAULT_SETTINGS.iceServers, ...(imported.settings.iceServers || {}) },
+        geochat: { ...DEFAULT_SETTINGS.geochat, ...(imported.settings.geochat || {}) },
+        map: { ...DEFAULT_SETTINGS.map, ...(imported.settings.map || {}) },
+        ui: { ...DEFAULT_SETTINGS.ui, ...(imported.settings.ui || {}) },
+        push: { ...DEFAULT_SETTINGS.push, ...(imported.settings.push || {}) },
+        backup: { ...DEFAULT_SETTINGS.backup, ...(imported.settings.backup || {}) },
+        customBlipTypes: imported.settings.customBlipTypes || prev.customBlipTypes || [],
+      }));
+    }
+    if (Array.isArray(imported.peers)) {
+      setPeers(prev => {
+        const map = new Map(prev.map(p => [p.peerId, p]));
+        imported.peers.forEach(p => {
+          if (!p || !p.peerId) return;
+          map.set(p.peerId, { ...(map.get(p.peerId) || {}), ...p });
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (Array.isArray(imported.blips)) {
+      setBlips(prev => {
+        const map = new Map(prev.map(b => [b.id, b]));
+        imported.blips.forEach(b => {
+          if (!b || !b.id) return;
+          map.set(b.id, map.get(b.id) || b);
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (imported.messages && typeof imported.messages === 'object') {
+      setMessages(prev => {
+        const next = { ...prev };
+        Object.keys(imported.messages).forEach(pid => {
+          const prevMsgs = next[pid] || [];
+          const incoming = imported.messages[pid] || [];
+          const seen = new Set(prevMsgs.map(m => m.id));
+          const merged = [...prevMsgs];
+          incoming.forEach(m => {
+            if (!m || !m.id) return;
+            if (!seen.has(m.id)) {
+              seen.add(m.id);
+              merged.push(m);
+            }
+          });
+          next[pid] = merged;
+        });
+        return next;
+      });
+    }
+    if (Array.isArray(imported.geochatMessages)) {
+      setGeochatMessages(prev => {
+        const map = new Map(prev.map(m => [m.id, m]));
+        imported.geochatMessages.forEach(m => {
+          if (!m || !m.id) return;
+          map.set(m.id, map.get(m.id) || m);
+        });
+        return Array.from(map.values());
+      });
+    }
+  }
+
   async function chooseBackupFolder() {
     if (!window.showDirectoryPicker) {
       showToast('Folder access not supported', 'var(--magenta)');
@@ -2570,6 +2708,38 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
       await idbSet('backupDir', handle);
       showToast('Backup folder set', 'var(--neon-green)');
     } catch {}
+  }
+
+  async function restoreFromFolder() {
+    if (!window.showDirectoryPicker) {
+      const fallback = readBackupFallback();
+      if (!fallback) return showToast('No in-app backup found', 'var(--magenta)');
+      try {
+        importBackupData(fallback);
+        showToast('Backup restored', 'var(--neon-green)');
+      } catch {
+        showToast('Invalid in-app backup', 'var(--magenta)');
+      }
+      return;
+    }
+    const root = await getBackupDirHandle();
+    if (!root) {
+      showToast('Backup folder not set', 'var(--amber)');
+      return;
+    }
+    try {
+      const subdir = await root.getDirectoryHandle('boost', { create: false });
+      const name = settings.backup && settings.backup.name ? settings.backup.name : (profile.displayName || profile.peerId || 'user');
+      const safeName = sanitizeFilename(name);
+      const fileHandle = await subdir.getFileHandle(`boost-backup(${safeName}).json`);
+      const file = await fileHandle.getFile();
+      const text = await file.text();
+      const imported = JSON.parse(text);
+      importBackupData(imported);
+      showToast('Backup restored', 'var(--neon-green)');
+    } catch {
+      showToast('Backup not found in folder', 'var(--magenta)');
+    }
   }
 
   async function registerPush() {
@@ -2671,20 +2841,30 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
     // Appearance
     e('div', { style: sectionStyle },
       e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, 'Appearance'),
-      e('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 } },
-        ['obsidian', 'slate', 'ivory', 'carbon', 'aurora', 'sand'].map(theme => e('button', {
-          key: theme,
-          onClick: () => updateSettings('ui.theme', theme),
+      e('div', { style: { display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 6 } },
+        themeOptions.map(t => e('button', {
+          key: t.id,
+          onClick: () => updateSettings('ui.theme', t.id),
           className: 'boost-btn',
           style: {
-            padding: '10px', borderRadius: 10,
-            background: (settings.ui && settings.ui.theme) === theme ? 'var(--bg-card2)' : 'var(--bg-deep)',
-            border: '1px solid ' + ((settings.ui && settings.ui.theme) === theme ? 'var(--accent)' : 'var(--border)'),
-            color: (settings.ui && settings.ui.theme) === theme ? 'var(--accent)' : 'var(--text-secondary)',
-            fontSize: 12, fontWeight: 600, cursor: 'pointer', textTransform: 'capitalize'
+            minWidth: 92, padding: '8px 10px', borderRadius: 999,
+            background: (settings.ui && settings.ui.theme) === t.id ? 'var(--bg-card2)' : 'var(--bg-deep)',
+            border: '1px solid ' + ((settings.ui && settings.ui.theme) === t.id ? 'var(--accent)' : 'var(--border)'),
+            color: (settings.ui && settings.ui.theme) === t.id ? 'var(--accent)' : 'var(--text-secondary)',
+            fontSize: 11, fontWeight: 600, cursor: 'pointer', textTransform: 'capitalize', whiteSpace: 'nowrap',
+            display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between', overflow: 'hidden'
           }
-        }, theme))
+        },
+          e('span', null, t.label),
+          e('span', { style: { display: 'flex', gap: 4, flexShrink: 0 } },
+            t.swatches.map((c, i) => e('span', {
+              key: i,
+              style: { width: 10, height: 10, borderRadius: '50%', background: c, border: '1px solid rgba(0,0,0,0.15)' }
+            }))
+          )
+        ))
       ),
+      e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'Swipe to see more themes'),
     ),
 
     // Custom Blip Types
@@ -2954,79 +3134,8 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
               reader.onload = (e) => {
                 try {
                   const imported = JSON.parse(e.target.result);
-                  if (!imported || typeof imported !== 'object') throw new Error('Invalid');
                   if (!confirm('Import backup and merge data?')) return;
-                  if (imported.profile) {
-                    setProfile(p => ({
-                      ...p,
-                      displayName: imported.profile.displayName || p.displayName,
-                      avatar: imported.profile.avatar || p.avatar,
-                      createdAt: imported.profile.createdAt || p.createdAt,
-                    }));
-                  }
-                  if (imported.settings) {
-                    setSettings(prev => ({
-                      ...prev,
-                      ...imported.settings,
-                      peerServer: { ...DEFAULT_SETTINGS.peerServer, ...(imported.settings.peerServer || {}) },
-                      iceServers: { ...DEFAULT_SETTINGS.iceServers, ...(imported.settings.iceServers || {}) },
-                      geochat: { ...DEFAULT_SETTINGS.geochat, ...(imported.settings.geochat || {}) },
-                      map: { ...DEFAULT_SETTINGS.map, ...(imported.settings.map || {}) },
-                      ui: { ...DEFAULT_SETTINGS.ui, ...(imported.settings.ui || {}) },
-                      push: { ...DEFAULT_SETTINGS.push, ...(imported.settings.push || {}) },
-                      customBlipTypes: imported.settings.customBlipTypes || prev.customBlipTypes || [],
-                    }));
-                  }
-                  if (Array.isArray(imported.peers)) {
-                    setPeers(prev => {
-                      const map = new Map(prev.map(p => [p.peerId, p]));
-                      imported.peers.forEach(p => {
-                        if (!p || !p.peerId) return;
-                        map.set(p.peerId, { ...(map.get(p.peerId) || {}), ...p });
-                      });
-                      return Array.from(map.values());
-                    });
-                  }
-                  if (Array.isArray(imported.blips)) {
-                    setBlips(prev => {
-                      const map = new Map(prev.map(b => [b.id, b]));
-                      imported.blips.forEach(b => {
-                        if (!b || !b.id) return;
-                        map.set(b.id, map.get(b.id) || b);
-                      });
-                      return Array.from(map.values());
-                    });
-                  }
-                  if (imported.messages && typeof imported.messages === 'object') {
-                    setMessages(prev => {
-                      const next = { ...prev };
-                      Object.keys(imported.messages).forEach(pid => {
-                        const prevMsgs = next[pid] || [];
-                        const incoming = imported.messages[pid] || [];
-                        const seen = new Set(prevMsgs.map(m => m.id));
-                        const merged = [...prevMsgs];
-                        incoming.forEach(m => {
-                          if (!m || !m.id) return;
-                          if (!seen.has(m.id)) {
-                            seen.add(m.id);
-                            merged.push(m);
-                          }
-                        });
-                        next[pid] = merged;
-                      });
-                      return next;
-                    });
-                  }
-                  if (Array.isArray(imported.geochatMessages)) {
-                    setGeochatMessages(prev => {
-                      const map = new Map(prev.map(m => [m.id, m]));
-                      imported.geochatMessages.forEach(m => {
-                        if (!m || !m.id) return;
-                        map.set(m.id, map.get(m.id) || m);
-                      });
-                      return Array.from(map.values());
-                    });
-                  }
+                  importBackupData(imported);
                   showToast('Backup imported', 'var(--neon-green)');
                 } catch { showToast('Invalid backup file', 'var(--magenta)'); }
               };
@@ -3080,6 +3189,63 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
           className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--magenta)', color: 'var(--magenta)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
         }, '🧹 Clear All Data'),
       ),
+    ),
+
+    // Backups
+    e('div', { style: sectionStyle },
+      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, 'Backups'),
+      e('div', { style: toggleRowStyle },
+        e('span', { style: { fontSize: 13, color: 'var(--text-primary)' } }, 'Daily Backup'),
+        e('input', {
+          type: 'checkbox',
+          checked: !!(settings.backup && settings.backup.enabled),
+          onChange: (ev) => updateSettings('backup.enabled', ev.target.checked),
+        }),
+      ),
+      e('div', { style: labelStyle }, 'BACKUP NAME'),
+      e('input', {
+        value: (settings.backup && settings.backup.name) || '',
+        onChange: (ev) => updateSettings('backup.name', ev.target.value),
+        placeholder: profile.displayName || profile.peerId || 'user',
+        style: inputStyle,
+      }),
+      e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+        e('button', {
+          onClick: chooseBackupFolder,
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Choose Folder'),
+        e('button', {
+          onClick: () => runDailyBackup(true, true),
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Backup Now'),
+        e('button', {
+          onClick: restoreFromFolder,
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--amber)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, window.showDirectoryPicker ? 'Restore From Folder' : 'Restore In-App Backup'),
+        e('button', {
+          onClick: () => {
+            const fallback = readBackupFallback();
+            if (!fallback) return showToast('No in-app backup found', 'var(--magenta)');
+            const data = JSON.stringify(fallback, null, 2);
+            const blob = new Blob([data], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'boost-backup.json';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+            showToast('Backup exported', 'var(--neon-green)');
+          },
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Export In-App Backup'),
+      ),
+      !window.showDirectoryPicker && e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'This browser cannot save to folders. Backups are stored in-app and will be removed if you clear site data.'),
+      window.showDirectoryPicker && e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'Saves to: selected folder / boost / boost-backup(name).json'),
     ),
 
     // About
