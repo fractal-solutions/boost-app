@@ -1349,7 +1349,7 @@ function App() {
       const sharePeers = peersRef.current.filter(p => p.shareActive);
       if (!sharePeers.length) return;
       const now = Date.now();
-      if (now - lastLocSentRef.current < 4000) return;
+      if (now - lastLocSentRef.current < 1200) return;
       sharePeers.forEach(p => {
         sendToPeer(p.peerId, {
           type: 'loc_update',
@@ -1360,7 +1360,7 @@ function App() {
         });
       });
       lastLocSentRef.current = now;
-    }, 2000);
+    }, 1000);
     return () => clearInterval(interval);
   }, [position]);
 
@@ -1885,6 +1885,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const userMarkerRef = useRef(null);
   const blipLayerRef = useRef(null);
   const peerLayerRef = useRef(null);
+  const peerMarkersRef = useRef({});
   const routeLayerRef = useRef(null);
   const routeAbortRef = useRef(null);
   const lastRouteKeyRef = useRef(null);
@@ -2086,18 +2087,51 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
 
   useEffect(() => {
     if (!peerLayerRef.current) return;
-    peerLayerRef.current.clearLayers();
+    const layer = peerLayerRef.current;
+    const markers = peerMarkersRef.current;
+
+    function animateMarker(marker, from, to, duration = 900) {
+      const start = performance.now();
+      function step(now) {
+        const t = Math.min(1, (now - start) / duration);
+        const lat = from.lat + (to.lat - from.lat) * t;
+        const lng = from.lng + (to.lng - from.lng) * t;
+        marker.setLatLng([lat, lng]);
+        if (t < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    }
+
+    const activeIds = new Set();
     peers.filter(p => p.shareActive && p.lastLoc).forEach(p => {
+      activeIds.add(p.peerId);
       const color = colorFromId(p.peerId);
-      const marker = L.circleMarker([p.lastLoc.lat, p.lastLoc.lng], {
-        radius: 8,
-        color,
-        weight: 2,
-        fillColor: color,
-        fillOpacity: 0.6,
-      });
-      marker.bindTooltip(p.displayName || p.peerId, { direction: 'top', offset: [0, -8], opacity: 0.9 });
-      peerLayerRef.current.addLayer(marker);
+      const target = L.latLng(p.lastLoc.lat, p.lastLoc.lng);
+      let marker = markers[p.peerId];
+      if (!marker) {
+        marker = L.circleMarker(target, {
+          radius: 8,
+          color,
+          weight: 2,
+          fillColor: color,
+          fillOpacity: 0.6,
+        });
+        marker.bindTooltip(p.displayName || p.peerId, { direction: 'top', offset: [0, -8], opacity: 0.9 });
+        marker.addTo(layer);
+        markers[p.peerId] = marker;
+      } else {
+        const from = marker.getLatLng();
+        animateMarker(marker, from, target);
+      }
+      marker.setStyle({ color, fillColor: color });
+      marker.setTooltipContent(p.displayName || p.peerId);
+    });
+
+    Object.keys(markers).forEach(pid => {
+      if (!activeIds.has(pid)) {
+        layer.removeLayer(markers[pid]);
+        delete markers[pid];
+      }
     });
   }, [peers]);
 
