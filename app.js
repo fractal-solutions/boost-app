@@ -1,4 +1,4 @@
-const { useState, useEffect, useRef, useCallback, useMemo } = React;
+﻿const { useState, useEffect, useRef, useCallback, useMemo } = React;
 const e = React.createElement;
 
 // ========================== UTILS ==========================
@@ -6,6 +6,9 @@ const e = React.createElement;
 const OUTBOX_RETRY_MS = 5000;
 const PING_INTERVAL_MS = 7000;
 const PONG_TIMEOUT_MS = 18000;
+const ACTIVITY_MAX = 200;
+const LOC_STALE_MS = 20000;
+const SIGNED_TYPES = ['post', 'geofeed_post', 'post_delete', 'blip', 'blip_update', 'blip_delete', 'blip_comment'];
 
 function generateId(prefix = '') {
   return prefix + Math.random().toString(36).substr(2, 9) + Date.now().toString(36);
@@ -21,6 +24,17 @@ function timeAgo(ts) {
   if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
   if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
   return Math.floor(diff / 86400000) + 'd ago';
+}
+
+function buildReactionCounts(reactionsBy) {
+  const counts = {};
+  if (!reactionsBy) return counts;
+  Object.keys(reactionsBy).forEach(pid => {
+    const rx = reactionsBy[pid];
+    if (!rx) return;
+    counts[rx] = (counts[rx] || 0) + 1;
+  });
+  return counts;
 }
 
 function distanceStr(d) {
@@ -59,6 +73,14 @@ function slugify(value) {
     .replace(/^_+|_+$/g, '');
 }
 
+function stableStringify(obj) {
+  if (obj === null || obj === undefined) return '';
+  if (typeof obj !== 'object') return JSON.stringify(obj);
+  if (Array.isArray(obj)) return '[' + obj.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(obj).sort();
+  return '{' + keys.map(k => JSON.stringify(k) + ':' + stableStringify(obj[k])).join(',') + '}';
+}
+
 
 function colorFromId(id) {
   let hash = 0;
@@ -75,6 +97,159 @@ function loadStorage(key, def) {
 }
 function saveStorage(key, val) {
   try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+}
+function loadStorageMaybe(key) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : undefined; } catch { return undefined; }
+}
+
+function getDeviceId() {
+  const existing = loadStorageMaybe('boost_device_id');
+  if (existing) return existing;
+  const id = generateId('dev_');
+  saveStorage('boost_device_id', id);
+  return id;
+}
+
+function storageKey(base, deviceId) {
+  return 'boost_' + deviceId + '_' + base;
+}
+
+function loadStorageWithMigration(deviceId, base, def) {
+  const nextKey = storageKey(base, deviceId);
+  const legacyKey = 'boost_' + base;
+  const current = loadStorageMaybe(nextKey);
+  if (current !== undefined) return current;
+  const legacy = loadStorageMaybe(legacyKey);
+  if (legacy !== undefined) {
+    saveStorage(nextKey, legacy);
+    return legacy;
+  }
+  return def;
+}
+
+function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  bytes.forEach((b) => { binary += String.fromCharCode(b); });
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+const IDB_NAME = 'boost_db';
+const IDB_STORE = 'handles';
+const FALLBACK_BACKUP_KEY = 'boost_backup_fallback';
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+        req.result.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbGet(key) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const store = tx.objectStore(IDB_STORE);
+    const req = store.get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbSet(key, val) {
+  const db = await idbOpen();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    const store = tx.objectStore(IDB_STORE);
+    const req = store.put(val, key);
+    req.onsuccess = () => resolve(true);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function sanitizeFilename(name) {
+  return (name || 'user').toString().trim().replace(/[^a-z0-9-_]+/gi, '_');
+}
+
+async function getBackupDirHandle() {
+  try {
+    return await idbGet('backupDir');
+  } catch {
+    return null;
+  }
+}
+
+async function writeBackupToFolder(payload, name, interactive = false) {
+  if (!window.showDirectoryPicker) return false;
+  const root = await getBackupDirHandle();
+  if (!root) return false;
+  try {
+    const perm = await root.queryPermission({ mode: 'readwrite' });
+    if (perm !== 'granted') {
+      if (!interactive) return false;
+      const req = await root.requestPermission({ mode: 'readwrite' });
+      if (req !== 'granted') return false;
+    }
+    const subdir = await root.getDirectoryHandle('boost', { create: true });
+    const safeName = sanitizeFilename(name);
+    const fileHandle = await subdir.getFileHandle(`boost-backup(${safeName}).json`, { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(JSON.stringify(payload, null, 2));
+    await writable.close();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeBackupFallback(payload) {
+  try {
+    localStorage.setItem(FALLBACK_BACKUP_KEY, JSON.stringify(payload));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readBackupFallback() {
+  try {
+    const raw = localStorage.getItem(FALLBACK_BACKUP_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function msUntilNext3am() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(3, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return next.getTime() - now.getTime();
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; ++i) {
+    outputArray[i] = rawData.charCodeAt(i);
+  }
+  return outputArray;
 }
 
 // Simple QR Code generator (alphanumeric)
@@ -162,10 +337,10 @@ function getCat(id, categories = BLIP_CATEGORIES) {
 }
 
 function getCategoryIcon(cat) {
-  if (!cat) return '•';
+  if (!cat) return '❓';
   if (cat.icon) return cat.icon;
   const label = (cat.label || '').trim();
-  return label ? label[0].toUpperCase() : '•';
+  return label ? label[0].toUpperCase() : '❓';
 }
 
 function withAlpha(color, hex) {
@@ -192,6 +367,8 @@ const DEFAULT_SETTINGS = {
   geochat: { enabled: false, zoneRadius: 1000, anonymous: true, messageExpiry: 24 },
   map: { defaultZoom: 14, hiddenCategories: [], darkTiles: true },
   ui: { theme: 'obsidian' },
+  push: { enabled: false, serverUrl: '', vapidPublicKey: '' },
+  backup: { enabled: false, name: '' },
   customBlipTypes: [],
 };
 
@@ -406,7 +583,7 @@ function QRScannerModal({ onScan, onClose }) {
           }
         }),
         e('div', { style: { position: 'absolute', bottom: 10, left: 0, right: 0, textAlign: 'center', fontSize: 12, color: 'var(--text-secondary)' } },
-          'QR scanning requires a QR library — use manual entry below'
+          'QR scanning requires a QR library - use manual entry below'
         ),
       ),
 
@@ -436,7 +613,7 @@ function QRScannerModal({ onScan, onClose }) {
 
 // ========================== BLIP DETAIL/EDIT MODAL ==========================
 
-function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAllPeers, sendToPeer, peers, categories }) {
+function BlipDetailModal({ blip, onClose, onUpdate, onDelete, onRoute, logActivity, profile, sendToAllPeers, sendToPeer, peers, categories }) {
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState(blip.title);
   const [editDesc, setEditDesc] = useState(blip.desc || '');
@@ -476,13 +653,14 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
     const updated = { ...blip, comments: newComments };
     onUpdate(updated);
     sendToAllPeers({ type: 'blip_comment', blipId: blip.id, comment });
+    if (logActivity) logActivity({ type: 'comment', title: comment.text, peerId: profile.peerId });
   }
 
   function handleBoost() {
     const updated = { ...blip, boosts: (blip.boosts || 0) + 1 };
     onUpdate(updated);
     sendToAllPeers({ type: 'blip_boost', blipId: blip.id });
-    showToast('🔥 Boosted!', 'var(--amber)');
+    showToast('⚡ Boosted!', 'var(--amber)');
   }
 
   return e('div', {
@@ -493,7 +671,7 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
       className: 'animate-slide-up',
       style: {
         position: 'relative', zIndex: 2, background: 'var(--bg-card)', borderTopLeftRadius: 20, borderTopRightRadius: 20,
-        padding: '20px 16px', width: '100%', maxWidth: 500, maxHeight: '85vh', overflow: 'auto',
+        padding: '20px 16px', width: '100%', maxWidth: 500, maxHeight: '70vh', overflow: 'auto',
         border: '1px solid var(--border)', borderBottom: 'none',
       }
     },
@@ -521,21 +699,23 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
             ),
           ),
         ),
-        e('div', { style: { display: 'flex', gap: 6 } },
+        e('div', { style: { display: 'flex', gap: 6, alignItems: 'center' } },
           isMine && !editing && e('button', {
             onClick: () => setEditing(true),
             className: 'boost-btn',
             style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', color: 'var(--accent)', fontSize: 12, cursor: 'pointer' }
           }, '✏️ Edit'),
+          e('button', {
+            onClick: () => { if (onRoute) { onRoute(blip); onClose(); } },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', color: 'var(--accent)', fontSize: 12, cursor: 'pointer' }
+          }, 'Route'),
+          e('div', { style: { flex: 1 } }),
           isMine && e('button', {
-            onClick: () => { onDelete(blip.id); onClose(); showToast('Blip removed', 'var(--magenta)'); },
+            onClick: () => { onDelete(blip); onClose(); showToast('Blip removed', 'var(--magenta)'); },
             className: 'boost-btn',
             style: { background: 'var(--bg-card2)', border: '1px solid var(--magenta)', borderRadius: 8, padding: '6px 10px', color: 'var(--magenta)', fontSize: 12, cursor: 'pointer' }
           }, '🗑️'),
-          e('button', {
-            onClick: onClose,
-            style: { background: 'none', border: 'none', color: 'var(--text-secondary)', fontSize: 20, cursor: 'pointer' }
-          }, '✕'),
         ),
       ),
 
@@ -586,7 +766,7 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
           onClick: handleBoost,
           className: 'boost-btn',
           style: { display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--amber)', background: 'var(--amber)15', border: '1px solid var(--amber)40', borderRadius: 6, padding: '4px 10px', cursor: 'pointer' }
-        }, '🔥 ' + (blip.boosts || 0) + ' Boost' + ((blip.boosts || 0) !== 1 ? 's' : '')),
+        }, '⚡ ' + (blip.boosts || 0) + ' Boost' + ((blip.boosts || 0) !== 1 ? 's' : '')),
       ),
 
       // Comments section
@@ -625,7 +805,7 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
             onClick: handleComment,
             className: 'boost-btn',
             style: { background: 'var(--accent)', color: 'var(--bg-deep)', border: 'none', borderRadius: '50%', width: 36, height: 36, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', fontSize: 14, fontWeight: 700, flexShrink: 0 }
-          }, '↑'),
+          }, '➤'),
         ),
       ),
     ),
@@ -637,9 +817,19 @@ function BlipDetailModal({ blip, onClose, onUpdate, onDelete, profile, sendToAll
 
 function App() {
   const [activeTab, setActiveTab] = useState('map');
-  const [profile, setProfile] = useState(() => loadStorage('boost_profile', { displayName: 'Anonymous', peerId: generatePeerId(), avatar: '⚡', createdAt: Date.now() }));
+  const deviceId = useMemo(() => getDeviceId(), []);
+  const settingsKey = storageKey('settings', deviceId);
+  const peersKey = storageKey('peers', deviceId);
+  const messagesKey = storageKey('messages', deviceId);
+  const blipsKey = storageKey('blips', deviceId);
+  const geochatKey = storageKey('geochat', deviceId);
+  const outboxKey = storageKey('outbox', deviceId);
+  const activityKey = storageKey('activity', deviceId);
+  const postsKey = storageKey('posts', deviceId);
+  const geoPostsKey = storageKey('geo_posts', deviceId);
+  const [profile, setProfile] = useState(() => loadStorage('boost_profile', { displayName: 'Anonymous', peerId: generatePeerId(), avatar: '🙂', createdAt: Date.now() }));
   const [settings, setSettings] = useState(() => {
-    const stored = loadStorage('boost_settings', DEFAULT_SETTINGS);
+    const stored = loadStorageWithMigration(deviceId, 'settings', DEFAULT_SETTINGS);
     return {
       ...DEFAULT_SETTINGS,
       ...stored,
@@ -648,51 +838,107 @@ function App() {
       geochat: { ...DEFAULT_SETTINGS.geochat, ...(stored.geochat || {}) },
       map: { ...DEFAULT_SETTINGS.map, ...(stored.map || {}) },
       ui: { ...DEFAULT_SETTINGS.ui, ...(stored.ui || {}) },
+      push: { ...DEFAULT_SETTINGS.push, ...(stored.push || {}) },
+      backup: { ...DEFAULT_SETTINGS.backup, ...(stored.backup || {}) },
       customBlipTypes: stored.customBlipTypes || [],
     };
   });
-  const [peers, setPeers] = useState(() => loadStorage('boost_peers', []));
-  const [messages, setMessages] = useState(() => loadStorage('boost_messages', {}));
+  const [peers, setPeers] = useState(() => loadStorageWithMigration(deviceId, 'peers', []));
+  const [messages, setMessages] = useState(() => loadStorageWithMigration(deviceId, 'messages', {}));
   const [blips, setBlips] = useState(() => {
-    const stored = loadStorage('boost_blips', []);
+    const stored = loadStorageWithMigration(deviceId, 'blips', []);
     return stored.filter(b => !b.expiresAt || b.expiresAt > Date.now());
   });
   const [geochatMessages, setGeochatMessages] = useState(() => {
     const stored = loadStorage('boost_geochat', []);
     return stored.filter(m => Date.now() - m.timestamp < 86400000);
   });
+  const [activity, setActivity] = useState(() => loadStorageWithMigration(deviceId, 'activity', []));
+  const [posts, setPosts] = useState(() => {
+    const stored = loadStorageWithMigration(deviceId, 'posts', []);
+    return stored
+      .map(p => ({ ...p, feed: p.feed || 'peers' }))
+      .filter(p => p.feed !== 'geofeed')
+      .filter(p => !p.expiresAt || p.expiresAt > Date.now());
+  });
+  const [geoPosts, setGeoPosts] = useState(() => {
+    const stored = loadStorageWithMigration(deviceId, 'geo_posts', []);
+    return stored
+      .map(p => ({ ...p, feed: p.feed || 'geofeed' }))
+      .filter(p => p.feed === 'geofeed')
+      .filter(p => !p.expiresAt || p.expiresAt > Date.now());
+  });
+  const [hiddenPosts, setHiddenPosts] = useState(() => loadStorageWithMigration(deviceId, 'hidden_posts', []));
+  const [lastBackupAt, setLastBackupAt] = useState(() => loadStorage('boost_last_backup_at', 0));
   const [position, setPosition] = useState(null);
   const [connectionStatus, setConnectionStatus] = useState('disconnected');
   const [activeChatPeer, setActiveChatPeer] = useState(null);
   const [unreadCounts, setUnreadCounts] = useState({});
-  const [outbox, setOutbox] = useState(() => loadStorage('boost_outbox', []));
+  const [outbox, setOutbox] = useState(() => loadStorageWithMigration(deviceId, 'outbox', []));
   const [networkOnline, setNetworkOnline] = useState(typeof navigator !== 'undefined' ? navigator.onLine : true);
+  const [feedFocus, setFeedFocus] = useState(null);
+  const [activityUnread, setActivityUnread] = useState(0);
+  const [swUpdateReady, setSwUpdateReady] = useState(false);
+  const [signReady, setSignReady] = useState(false);
 
   const peerRef = useRef(null);
   const connectionsRef = useRef({});
   const peerHealthRef = useRef({});
   const peersRef = useRef([]);
+  const postsRef = useRef([]);
+  const geoPostsRef = useRef([]);
+  const peerKeysRef = useRef({});
+  const peerPubRef = useRef({});
+  const peerSignPubRef = useRef({});
+  const localKeyRef = useRef({ pair: null, pubJwk: null });
+  const localSignKeyRef = useRef({ pair: null, pubJwk: null });
   const lastLocSentRef = useRef(0);
   const mapRef = useRef(null);
   const markersRef = useRef({});
 
   // Save to localStorage on changes
   useEffect(() => { saveStorage('boost_profile', profile); }, [profile]);
-  useEffect(() => { saveStorage('boost_settings', settings); }, [settings]);
+  useEffect(() => { saveStorage(settingsKey, settings); }, [settings]);
+  useEffect(() => { saveStorage('boost_last_backup_at', lastBackupAt); }, [lastBackupAt]);
   useEffect(() => {
     const theme = (settings.ui && settings.ui.theme) || 'obsidian';
     const root = document.body;
-    root.classList.remove('theme-obsidian', 'theme-slate', 'theme-ivory');
+    root.classList.remove(
+      'theme-onyx', 'theme-paper',
+      'theme-dusk', 'theme-neon', 'theme-pastel', 'theme-sunset', 'theme-ocean', 'theme-rose',
+      'theme-matcha', 'theme-lavender', 'theme-desert', 'theme-mono', 'theme-ivory'
+    );
     root.classList.add('theme-' + theme);
   }, [settings.ui && settings.ui.theme]);
 
   const allCategories = useMemo(() => getAllCategories(settings.customBlipTypes), [settings.customBlipTypes]);
-  useEffect(() => { saveStorage('boost_peers', peers); }, [peers]);
+  useEffect(() => { saveStorage(peersKey, peers); }, [peers]);
   useEffect(() => { peersRef.current = peers; }, [peers]);
-  useEffect(() => { saveStorage('boost_messages', messages); }, [messages]);
-  useEffect(() => { saveStorage('boost_blips', blips); }, [blips]);
-  useEffect(() => { saveStorage('boost_geochat', geochatMessages); }, [geochatMessages]);
-  useEffect(() => { saveStorage('boost_outbox', outbox); }, [outbox]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(messagesKey, messages), 600);
+    return () => clearTimeout(t);
+  }, [messages]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(blipsKey, blips), 600);
+    return () => clearTimeout(t);
+  }, [blips]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(geochatKey, geochatMessages), 600);
+    return () => clearTimeout(t);
+  }, [geochatMessages]);
+  useEffect(() => { saveStorage(outboxKey, outbox); }, [outbox]);
+  useEffect(() => { saveStorage(activityKey, activity); }, [activity]);
+  useEffect(() => { saveStorage(storageKey('hidden_posts', deviceId), hiddenPosts); }, [hiddenPosts]);
+  useEffect(() => { postsRef.current = posts; }, [posts]);
+  useEffect(() => { geoPostsRef.current = geoPosts; }, [geoPosts]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(postsKey, posts), 600);
+    return () => clearTimeout(t);
+  }, [posts]);
+  useEffect(() => {
+    const t = setTimeout(() => saveStorage(geoPostsKey, geoPosts), 600);
+    return () => clearTimeout(t);
+  }, [geoPosts]);
 
   useEffect(() => {
     function handleOnline() {
@@ -719,6 +965,54 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stored = loadStorageMaybe('boost_e2e_keys');
+        if (stored && stored.privateJwk && stored.publicJwk) {
+          const priv = await crypto.subtle.importKey('jwk', stored.privateJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
+          const pub = await crypto.subtle.importKey('jwk', stored.publicJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+          if (cancelled) return;
+          localKeyRef.current = { pair: { privateKey: priv, publicKey: pub }, pubJwk: stored.publicJwk };
+          return;
+        }
+        const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
+        const publicJwk = await crypto.subtle.exportKey('jwk', pair.publicKey);
+        const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+        saveStorage('boost_e2e_keys', { publicJwk, privateJwk });
+        if (cancelled) return;
+        localKeyRef.current = { pair, pubJwk: publicJwk };
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const stored = loadStorageMaybe('boost_sign_keys');
+        if (stored && stored.privateJwk && stored.publicJwk) {
+          const priv = await crypto.subtle.importKey('jwk', stored.privateJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+          const pub = await crypto.subtle.importKey('jwk', stored.publicJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+          if (cancelled) return;
+          localSignKeyRef.current = { pair: { privateKey: priv, publicKey: pub }, pubJwk: stored.publicJwk };
+          setSignReady(true);
+          return;
+        }
+        const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+        const publicJwk = await crypto.subtle.exportKey('jwk', pair.publicKey);
+        const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+        saveStorage('boost_sign_keys', { publicJwk, privateJwk });
+        if (cancelled) return;
+        localSignKeyRef.current = { pair, pubJwk: publicJwk };
+        setSignReady(true);
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
   // Geolocation
   useEffect(() => {
     if (!navigator.geolocation) return;
@@ -735,6 +1029,37 @@ function App() {
     initPeer();
     return () => { if (peerRef.current) peerRef.current.destroy(); };
   }, []);
+
+  useEffect(() => {
+    const onUpdate = () => setSwUpdateReady(true);
+    window.addEventListener('boost-sw-updated', onUpdate);
+    return () => window.removeEventListener('boost-sw-updated', onUpdate);
+  }, []);
+
+  useEffect(() => {
+    if (!signReady || !localSignKeyRef.current.pubJwk) return;
+    Object.keys(connectionsRef.current).forEach(peerId => {
+      const conn = connectionsRef.current[peerId];
+      if (conn && conn.open) {
+        try { conn.send({ type: 'sign_pub', pub: localSignKeyRef.current.pubJwk }); } catch {}
+      }
+      const now = Date.now();
+      const recentPosts = (postsRef.current || []).filter(p => p.senderId === profile.peerId && (p.feed !== 'geofeed') && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      recentPosts.forEach(p => { sendToPeer(peerId, { type: 'post', post: p }); });
+      const recentGeo = (geoPostsRef.current || []).filter(p => p.senderId === profile.peerId && (p.feed === 'geofeed' || !p.feed) && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      recentGeo.forEach(p => { sendToPeer(peerId, { type: 'geofeed_post', post: p }); });
+    });
+  }, [signReady]);
+
+  function applyUpdate() {
+    if (!('serviceWorker' in navigator)) return window.location.reload();
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (reg && reg.waiting) {
+        reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+      }
+      setTimeout(() => window.location.reload(), 400);
+    }).catch(() => window.location.reload());
+  }
 
   function getPeerConfig() {
     const cfg = {};
@@ -768,7 +1093,7 @@ function App() {
       setProfile(p => ({ ...p, peerId: id }));
       // Reconnect to known peers
       peers.forEach(p => {
-        if (!connectionsRef.current[p.peerId]) {
+        if (!connectionsRef.current[p.peerId] && !p.blocked) {
           connectToPeer(p.peerId);
         }
       });
@@ -803,8 +1128,125 @@ function App() {
     });
   }
 
+  function logActivity(entry) {
+    setActivity(prev => {
+      const next = [{ id: generateId('act'), ts: Date.now(), ...entry }, ...prev];
+      return next.slice(0, ACTIVITY_MAX);
+    });
+    if (activeTab !== 'activity') {
+      setActivityUnread(prev => prev + 1);
+    }
+  }
+
+  async function deriveSharedKey(peerId, peerPubJwk) {
+    try {
+      if (!localKeyRef.current.pair || !peerPubJwk) return null;
+      const peerPub = await crypto.subtle.importKey('jwk', peerPubJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+      const key = await crypto.subtle.deriveKey(
+        { name: 'ECDH', public: peerPub },
+        localKeyRef.current.pair.privateKey,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+      );
+      peerKeysRef.current[peerId] = key;
+      peerPubRef.current[peerId] = peerPubJwk;
+      updatePeer(peerId, { secure: true });
+      return key;
+    } catch {
+      return null;
+    }
+  }
+
+  async function encryptForPeer(peerId, data) {
+    const key = peerKeysRef.current[peerId];
+    if (!key || !crypto || !crypto.subtle) return data;
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encoded = new TextEncoder().encode(JSON.stringify(data));
+    const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoded);
+    return { type: 'enc', iv: arrayBufferToBase64(iv), payload: arrayBufferToBase64(cipher) };
+  }
+
+  async function decryptFromPeer(peerId, data) {
+    const key = peerKeysRef.current[peerId];
+    if (!key || !crypto || !crypto.subtle) return null;
+    try {
+      const iv = new Uint8Array(base64ToArrayBuffer(data.iv));
+      const payload = base64ToArrayBuffer(data.payload);
+      const decoded = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, payload);
+      const text = new TextDecoder().decode(decoded);
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  }
+
+  async function signData(data) {
+    if (!SIGNED_TYPES.includes(data.type)) return data;
+    if (!localSignKeyRef.current.pair || !crypto || !crypto.subtle) return data;
+    const base = { ...data };
+    delete base.sig;
+    delete base.sigBy;
+    delete base.sigTs;
+    const payload = new TextEncoder().encode(stableStringify(base));
+    try {
+      const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, localSignKeyRef.current.pair.privateKey, payload);
+      return { ...base, sig: arrayBufferToBase64(sig), sigBy: profile.peerId, sigTs: Date.now() };
+    } catch {
+      return data;
+    }
+  }
+
+  async function verifySignedData(fromPeer, data) {
+    if (!SIGNED_TYPES.includes(data.type)) return true;
+    if (!data.sig || !data.sigBy) return false;
+    if (data.sigBy !== fromPeer) return false;
+    const pubJwk = peerSignPubRef.current[fromPeer];
+    if (!pubJwk || !crypto || !crypto.subtle) return false;
+    try {
+      const pub = await crypto.subtle.importKey('jwk', pubJwk, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['verify']);
+      const base = { ...data };
+      delete base.sig;
+      delete base.sigBy;
+      delete base.sigTs;
+      const payload = new TextEncoder().encode(stableStringify(base));
+      return await crypto.subtle.verify({ name: 'ECDSA', hash: 'SHA-256' }, pub, base64ToArrayBuffer(data.sig), payload);
+    } catch {
+      return false;
+    }
+  }
+
+  function isPeerBlocked(peerId) {
+    const peer = peersRef.current.find(p => p.peerId === peerId);
+    return !!(peer && peer.blocked);
+  }
+
+  function blockPeer(peerId, shouldBlock) {
+    if (!peerId) return;
+    if (shouldBlock) {
+      try { sendToPeer(peerId, { type: 'loc_stop' }); } catch {}
+      if (connectionsRef.current[peerId]) {
+        try { connectionsRef.current[peerId].close(); } catch {}
+        delete connectionsRef.current[peerId];
+      }
+      updatePeer(peerId, { blocked: true, connected: false, shareOut: false, shareIn: false, shareActive: false });
+      setOutbox(prev => prev.filter(item => item.peerId !== peerId));
+    } else {
+      updatePeer(peerId, { blocked: false });
+    }
+  }
+
+  function toggleMutePeer(peerId, muted) {
+    if (!peerId) return;
+    updatePeer(peerId, { muted: !!muted });
+  }
+
   function handleConnection(conn) {
     const peerId = conn.peer;
+    if (isPeerBlocked(peerId)) {
+      try { conn.close(); } catch {}
+      return;
+    }
     connectionsRef.current[peerId] = conn;
     peerHealthRef.current[peerId] = { lastPong: Date.now() };
 
@@ -815,13 +1257,23 @@ function App() {
         }
         return [...prev, { peerId, displayName: peerId, lastSeen: Date.now(), connected: true }];
       });
+      logActivity({ type: 'connect', title: 'Peer connected', peerId });
       // Send introduction
-      conn.send({ type: 'intro', displayName: profile.displayName, avatar: profile.avatar });
+      conn.send({ type: 'intro', displayName: profile.displayName, avatar: profile.avatar, signPub: localSignKeyRef.current.pubJwk || null });
+      if (localKeyRef.current.pubJwk) {
+        conn.send({ type: 'key_exchange', pub: localKeyRef.current.pubJwk });
+      }
       // Sync existing blips to new peer
       const myBlips = blips.filter(b => !b.isRemote);
       myBlips.forEach(b => {
         conn.send({ type: 'blip', blip: b });
       });
+      // Sync recent posts to new peer
+      const now = Date.now();
+      const recentPosts = (postsRef.current || []).filter(p => p.senderId === profile.peerId && (p.feed !== 'geofeed') && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      recentPosts.forEach(p => { sendToPeer(peerId, { type: 'post', post: p }); });
+      const recentGeo = (geoPostsRef.current || []).filter(p => p.senderId === profile.peerId && (p.feed === 'geofeed' || !p.feed) && (!p.expiresAt || p.expiresAt > now)).slice(0, 50);
+      recentGeo.forEach(p => { sendToPeer(peerId, { type: 'geofeed_post', post: p }); });
       flushOutbox(peerId);
     });
 
@@ -845,6 +1297,7 @@ function App() {
     if (!peerRef.current || peerRef.current.destroyed) return;
     if (connectionsRef.current[peerId]) return;
     if (peerId === profile.peerId) { showToast("Can't connect to yourself!", 'var(--magenta)'); return; }
+    if (isPeerBlocked(peerId)) { showToast('Peer is blocked', 'var(--magenta)'); return; }
     try {
       const conn = peerRef.current.connect(peerId, { reliable: true });
       handleConnection(conn);
@@ -853,16 +1306,54 @@ function App() {
     }
   }
 
-  function handlePeerData(fromPeer, data) {
+  function updatePostById(setter, postId, updater) {
+    if (!postId) return;
+    setter(prev => {
+      let changed = false;
+      const next = prev.map(p => {
+        if (p.id !== postId) return p;
+        changed = true;
+        return updater(p);
+      });
+      return changed ? next : prev;
+    });
+  }
+
+  async function handlePeerData(fromPeer, data) {
     if (!data || !data.type) return;
-    touchPeer(fromPeer);
+    if (data.type === 'enc') {
+      const decrypted = await decryptFromPeer(fromPeer, data);
+      if (!decrypted) return;
+      data = decrypted;
+    }
+    const blocked = isPeerBlocked(fromPeer);
+    if (blocked && data.type !== 'ack') return;
+    if (!blocked) touchPeer(fromPeer);
     if (data.deliveryId && data.type !== 'ack') {
       try { connectionsRef.current[fromPeer] && connectionsRef.current[fromPeer].send({ type: 'ack', deliveryId: data.deliveryId }); } catch {}
+    }
+    if (SIGNED_TYPES.includes(data.type)) {
+      const ok = await verifySignedData(fromPeer, data);
+      if (!ok) return;
     }
 
     switch (data.type) {
       case 'intro':
-        setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, displayName: data.displayName || fromPeer, avatar: data.avatar } : p));
+        if (data.signPub) {
+          peerSignPubRef.current[fromPeer] = data.signPub;
+        }
+        setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, displayName: data.displayName || fromPeer, avatar: data.avatar, signPub: data.signPub || p.signPub } : p));
+        break;
+      case 'sign_pub':
+        if (data.pub) {
+          peerSignPubRef.current[fromPeer] = data.pub;
+          setPeers(prev => prev.map(p => p.peerId === fromPeer ? { ...p, signPub: data.pub } : p));
+        }
+        break;
+      case 'key_exchange':
+        if (data.pub) {
+          await deriveSharedKey(fromPeer, data.pub);
+        }
         break;
       case 'loc_share_req':
         updatePeer(fromPeer, { shareIn: true, lastSeen: Date.now() });
@@ -901,6 +1392,8 @@ function App() {
           const convMsgs = prev[fromPeer] || [];
           return { ...prev, [fromPeer]: [...convMsgs, { id: generateId('msg'), text: data.message, sender: fromPeer, timestamp: data.timestamp || Date.now(), blipAttachment: data.blipAttachment || null }] };
         });
+        logActivity({ type: 'chat', title: 'Message', peerId: fromPeer });
+        showToast((data.senderName || fromPeer) + ' sent a message', 'var(--accent)');
         if (activeChatPeer !== fromPeer) {
           setUnreadCounts(prev => ({ ...prev, [fromPeer]: (prev[fromPeer] || 0) + 1 }));
         }
@@ -912,6 +1405,7 @@ function App() {
             return [...prev, { ...data.blip, isRemote: true }];
           });
           showToast('New blip from ' + (data.blip.creatorName || 'peer'), 'var(--neon-green)');
+          logActivity({ type: 'blip', title: data.blip.title || 'Blip', peerId: fromPeer });
         }
         break;
       case 'blip_update':
@@ -930,6 +1424,7 @@ function App() {
             return b;
           }));
           showToast('💬 New comment on blip', 'var(--accent)');
+          logActivity({ type: 'comment', title: data.comment.text || 'Comment', peerId: fromPeer });
         }
         break;
       case 'geochat':
@@ -956,6 +1451,102 @@ function App() {
       case 'blip_boost':
         if (data.blipId) {
           setBlips(prev => prev.map(b => b.id === data.blipId ? { ...b, boosts: (b.boosts || 0) + 1 } : b));
+        }
+        break;
+      case 'blip_delete':
+        if (data.blipId) {
+          setBlips(prev => prev.filter(b => b.id !== data.blipId));
+        }
+        break;
+      case 'buzz':
+        showToast((data.senderName || fromPeer) + ' buzzed you', 'var(--amber)');
+        logActivity({ type: 'buzz', title: 'Buzz', peerId: fromPeer });
+        break;
+      case 'post':
+        if (data.post && (!data.post.expiresAt || data.post.expiresAt > Date.now())) {
+          const incoming = { ...data.post, feed: data.post.feed || 'peers' };
+          setPosts(prev => {
+            if (prev.find(p => p.id === incoming.id)) return prev;
+            return [incoming, ...prev].slice(0, 200);
+          });
+          logActivity({ type: 'feed_post', title: data.post.text || 'New post', peerId: fromPeer, action: { tab: 'feed', mode: 'peers', postId: data.post.id } });
+        }
+        break;
+      case 'geofeed_post':
+        if (data.post && (!data.post.expiresAt || data.post.expiresAt > Date.now())) {
+          const incoming = { ...data.post, feed: data.post.feed || 'geofeed' };
+          setGeoPosts(prev => {
+            if (prev.find(p => p.id === incoming.id)) return prev;
+            return [incoming, ...prev].slice(0, 200);
+          });
+        }
+        break;
+      case 'post_delete':
+        if (data.postId) {
+          if (data.feed === 'geofeed') {
+            setGeoPosts(prev => prev.filter(p => p.id !== data.postId));
+          } else {
+            setPosts(prev => prev.filter(p => p.id !== data.postId));
+          }
+        }
+        break;
+      case 'post_reaction':
+        if (data.postId && data.reaction) {
+          const senderId = data.senderId || fromPeer;
+          const updater = (p) => {
+            const reactionsBy = { ...(p.reactionsBy || {}) };
+            const prev = reactionsBy[senderId];
+            if (prev === data.reaction) {
+              delete reactionsBy[senderId];
+            } else {
+              reactionsBy[senderId] = data.reaction;
+            }
+            return { ...p, reactionsBy, reactions: buildReactionCounts(reactionsBy) };
+          };
+          if (data.feed === 'geofeed') updatePostById(setGeoPosts, data.postId, updater);
+          else updatePostById(setPosts, data.postId, updater);
+          if (senderId === profile.peerId) break;
+          if (data.feed !== 'geofeed') {
+            const post = (postsRef.current || []).find(p => p.id === data.postId);
+            const isMine = post && post.senderId === profile.peerId;
+            const iReplied = post && (post.replies || []).some(r => r.senderId === profile.peerId);
+            if (isMine || iReplied) {
+              logActivity({ type: 'feed_reaction', title: data.reaction, peerId: fromPeer, action: { tab: 'feed', mode: data.feed || 'peers', postId: data.postId, openReplies: true } });
+            }
+          } else {
+            const post = (geoPostsRef.current || []).find(p => p.id === data.postId);
+            const isMine = post && post.senderId === profile.peerId;
+            const iReplied = post && (post.replies || []).some(r => r.senderId === profile.peerId);
+            if (isMine || iReplied) {
+              logActivity({ type: 'feed_reaction', title: data.reaction, peerId: fromPeer, action: { tab: 'feed', mode: 'geofeed', postId: data.postId, openReplies: true } });
+            }
+          }
+        }
+        break;
+      case 'post_reply':
+        if (data.postId && data.reply) {
+          const updater = (p) => {
+            const replies = p.replies || [];
+            if (replies.find(r => r.id === data.reply.id)) return p;
+            return { ...p, replies: [...replies, data.reply] };
+          };
+          if (data.feed === 'geofeed') updatePostById(setGeoPosts, data.postId, updater);
+          else updatePostById(setPosts, data.postId, updater);
+          if (data.feed !== 'geofeed') {
+            const post = (postsRef.current || []).find(p => p.id === data.postId);
+            const isMine = post && post.senderId === profile.peerId;
+            const iReplied = post && (post.replies || []).some(r => r.senderId === profile.peerId);
+            if (isMine || iReplied) {
+              logActivity({ type: 'feed_reply', title: data.reply.text || 'Reply', peerId: fromPeer, action: { tab: 'feed', mode: data.feed || 'peers', postId: data.postId, openReplies: true } });
+            }
+          } else {
+            const post = (geoPostsRef.current || []).find(p => p.id === data.postId);
+            const isMine = post && post.senderId === profile.peerId;
+            const iReplied = post && (post.replies || []).some(r => r.senderId === profile.peerId);
+            if (isMine || iReplied) {
+              logActivity({ type: 'feed_reply', title: data.reply.text || 'Reply', peerId: fromPeer, action: { tab: 'feed', mode: 'geofeed', postId: data.postId, openReplies: true } });
+            }
+          }
         }
         break;
       case 'ping':
@@ -1009,12 +1600,11 @@ function App() {
     });
   }, []);
 
-  function queueOutbox(peerId, payload) {
-    const id = payload.deliveryId || generateId('out');
+  function queueOutbox(peerId, payload, id) {
     const entry = {
       id,
       peerId,
-      payload: { ...payload, deliveryId: id },
+      payload,
       createdAt: Date.now(),
       attempts: 0,
       lastAttempt: 0,
@@ -1024,33 +1614,138 @@ function App() {
   }
 
   function sendToAllPeers(data) {
-    Object.values(connectionsRef.current).forEach(conn => {
-      try { conn.send(data); } catch {}
+    Object.keys(connectionsRef.current).forEach(peerId => {
+      sendToPeer(peerId, data);
     });
   }
 
-  function sendToPeer(peerId, data) {
+  async function sendToPeer(peerId, data) {
+    if (isPeerBlocked(peerId)) return;
     const conn = connectionsRef.current[peerId];
     if (conn && conn.open) {
-      try { conn.send(data); } catch {}
+      try {
+        const signed = await signData(data);
+        const payload = (signed.type === 'ack' || signed.type === 'ping' || signed.type === 'pong' || signed.type === 'key_exchange') ? signed : await encryptForPeer(peerId, signed);
+        conn.send(payload);
+      } catch {}
     }
   }
 
-  function sendReliableToPeer(peerId, data) {
-    const deliveryId = queueOutbox(peerId, data);
+  async function sendReliableToPeer(peerId, data) {
+    if (isPeerBlocked(peerId)) return null;
+    const deliveryId = data.deliveryId || generateId('out');
     const conn = connectionsRef.current[peerId];
     if (!conn || !conn.open) {
+      const payload = await signData({ ...data, deliveryId });
+      const wrapped = (payload.type === 'ack' || payload.type === 'ping' || payload.type === 'pong' || payload.type === 'key_exchange')
+        ? payload
+        : await encryptForPeer(peerId, payload);
+      queueOutbox(peerId, wrapped, deliveryId);
       connectToPeer(peerId);
       return deliveryId;
     }
     if (navigator.onLine) {
-      try { conn.send({ ...data, deliveryId }); } catch {}
+      try {
+        const payload = await signData({ ...data, deliveryId });
+        const wrapped = (payload.type === 'ack' || payload.type === 'ping' || payload.type === 'pong' || payload.type === 'key_exchange')
+          ? payload
+          : await encryptForPeer(peerId, payload);
+        queueOutbox(peerId, wrapped, deliveryId);
+        conn.send(wrapped);
+      } catch {}
     }
     return deliveryId;
   }
 
+  function sendReliableToAllPeers(data) {
+    peersRef.current.forEach(p => {
+      if (p.peerId && p.peerId !== profile.peerId) {
+        sendReliableToPeer(p.peerId, data);
+      }
+    });
+  }
+
+  function buildBackupPayload() {
+    return {
+      version: 1,
+      profile: { displayName: profile.displayName, avatar: profile.avatar, createdAt: profile.createdAt },
+      settings,
+      peers,
+      messages,
+      blips,
+      geochatMessages,
+      posts,
+      geoPosts,
+      activity,
+      hiddenPosts,
+    };
+  }
+
+  async function runDailyBackup(force = false, interactive = false) {
+    const backupEnabled = !!(settings.backup && settings.backup.enabled);
+    if (!backupEnabled && !force) return;
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const lastKey = lastBackupAt ? new Date(lastBackupAt).toISOString().slice(0, 10) : null;
+    if (!force && lastKey === todayKey) return;
+    const name = settings.backup.name || profile.displayName || profile.peerId || 'user';
+    const payload = buildBackupPayload();
+    const folderOk = await writeBackupToFolder(payload, name, interactive);
+    const fallbackOk = writeBackupFallback(payload);
+    if (folderOk || fallbackOk) {
+      setLastBackupAt(Date.now());
+      if (interactive) {
+        showToast(folderOk ? 'Backup saved' : 'Backup saved (in-app)', 'var(--neon-green)');
+      }
+      return;
+    }
+    if (interactive) showToast('Backup failed', 'var(--magenta)');
+  }
+
+  async function buzzPeer(peerId) {
+    if (!peerId) return;
+    if (isPeerBlocked(peerId)) { showToast('Peer is blocked', 'var(--magenta)'); return; }
+    sendReliableToPeer(peerId, { type: 'buzz', timestamp: Date.now(), senderName: profile.displayName });
+    logActivity({ type: 'buzz', title: 'Buzz', peerId });
+    if (settings.push && settings.push.enabled && settings.push.serverUrl) {
+      const serverUrl = settings.push.serverUrl.replace(/\/$/, '');
+      try {
+        await fetch(serverUrl + '/buzz', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ to: peerId, from: profile.peerId, senderName: profile.displayName }),
+        });
+      } catch {}
+    }
+    showToast('Buzz sent', 'var(--amber)');
+  }
+
+  function removePeer(peerId, deleteHistory) {
+    if (!peerId) return;
+    try { sendToPeer(peerId, { type: 'loc_stop' }); } catch {}
+    if (connectionsRef.current[peerId]) {
+      try { connectionsRef.current[peerId].close(); } catch {}
+      delete connectionsRef.current[peerId];
+    }
+    setPeers(prev => prev.filter(p => p.peerId !== peerId));
+    setUnreadCounts(prev => {
+      const next = { ...prev };
+      delete next[peerId];
+      return next;
+    });
+    setOutbox(prev => prev.filter(item => item.peerId !== peerId));
+    if (deleteHistory) {
+      setMessages(prev => {
+        const next = { ...prev };
+        delete next[peerId];
+        return next;
+      });
+      setBlips(prev => prev.filter(b => b.creator !== peerId));
+    }
+  }
+
   function toggleLocationShare(peerId, enabled) {
     if (!peerId) return;
+    if (isPeerBlocked(peerId)) { showToast('Peer is blocked', 'var(--magenta)'); return; }
     if (!enabled) {
       updatePeer(peerId, { shareOut: false, shareActive: false });
       sendToPeer(peerId, { type: 'loc_stop' });
@@ -1072,7 +1767,7 @@ function App() {
       const sharePeers = peersRef.current.filter(p => p.shareActive);
       if (!sharePeers.length) return;
       const now = Date.now();
-      if (now - lastLocSentRef.current < 4000) return;
+      if (now - lastLocSentRef.current < 1200) return;
       sharePeers.forEach(p => {
         sendToPeer(p.peerId, {
           type: 'loc_update',
@@ -1083,7 +1778,7 @@ function App() {
         });
       });
       lastLocSentRef.current = now;
-    }, 2000);
+    }, 1000);
     return () => clearInterval(interval);
   }, [position]);
 
@@ -1106,6 +1801,23 @@ function App() {
     return () => clearInterval(interval);
   }, [flushOutbox]);
 
+  useEffect(() => {
+    if (!settings.backup || !settings.backup.enabled) return;
+    let timeoutId = null;
+    let intervalId = null;
+    const schedule = () => {
+      timeoutId = setTimeout(() => {
+        runDailyBackup(false, false);
+        intervalId = setInterval(() => { runDailyBackup(false, false); }, 24 * 60 * 60 * 1000);
+      }, msUntilNext3am());
+    };
+    schedule();
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (intervalId) clearInterval(intervalId);
+    };
+  }, [settings.backup && settings.backup.enabled, settings.backup && settings.backup.name, profile.displayName, profile.peerId, blips, peers, messages, geochatMessages, posts, geoPosts, activity, settings, lastBackupAt]);
+
   // Blip expiry check
   useEffect(() => {
     const interval = setInterval(() => {
@@ -1114,7 +1826,22 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setPosts(prev => prev.filter(p => !p.expiresAt || p.expiresAt > Date.now()));
+      setGeoPosts(prev => prev.filter(p => !p.expiresAt || p.expiresAt > Date.now()));
+    }, 60000);
+    return () => clearInterval(interval);
+  }, []);
+
   const connectedPeersCount = peers.filter(p => p.connected).length;
+  const mutedPeerIds = useMemo(() => new Set(peers.filter(p => p.muted).map(p => p.peerId)), [peers]);
+
+  useEffect(() => {
+    if (activeTab === 'activity') {
+      setActivityUnread(0);
+    }
+  }, [activeTab]);
 
   // Layout
   return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column', background: 'var(--bg-deep)' } },
@@ -1122,13 +1849,33 @@ function App() {
     e(Header, { profile, connectionStatus, connectedPeersCount, onReconnect: initPeer }),
     // Main content area
     e('div', { style: { flex: 1, overflow: 'hidden', position: 'relative' } },
-      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, unreadCounts, setUnreadCounts, blips, categories: allCategories }),
-      activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, settings, peers, categories: allCategories }),
+      swUpdateReady && e('div', {
+        style: {
+          position: 'absolute', top: 8, left: '50%', transform: 'translateX(-50%)',
+          zIndex: 50, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 999,
+          padding: '6px 12px', display: 'flex', gap: 8, alignItems: 'center', boxShadow: 'var(--shadow-soft)'
+        }
+      },
+        e('span', { style: { fontSize: 11, color: 'var(--text-primary)', fontWeight: 600 } }, 'Update available'),
+        e('button', {
+          onClick: applyUpdate,
+          className: 'boost-btn',
+          style: { background: 'var(--accent)', color: '#fff', border: 'none', borderRadius: 999, padding: '4px 10px', fontSize: 11, cursor: 'pointer', fontWeight: 700 }
+        }, 'Refresh')
+      ),
+      activeTab === 'chat' && e(ChatView, { profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories: allCategories, setActiveTab }),
+      activeTab === 'map' && e(MapView, { position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories: allCategories, logActivity }),
+      activeTab === 'feed' && e(FeedView, { position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings, feedFocus, setFeedFocus, hiddenPosts, setHiddenPosts, mutedPeerIds, toggleMutePeer }),
       activeTab === 'geochat' && e(GeochatView, { position, geochatMessages, setGeochatMessages, profile, sendToAllPeers, settings }),
-      activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, setMessages, setGeochatMessages, setPeers, categories: allCategories }),
+      activeTab === 'activity' && e(ActivityView, { activity, peers, onOpenActivity: (action) => {
+        if (!action) return;
+        if (action.tab) setActiveTab(action.tab);
+        if (action.tab === 'feed') setFeedFocus(action);
+      }}),
+      activeTab === 'settings' && e(SettingsView, { profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, hiddenPosts, setHiddenPosts, peers, setPeers, categories: allCategories, runDailyBackup }),
     ),
     // Bottom nav
-    e(BottomNav, { activeTab, setActiveTab, unreadCounts })
+    e(BottomNav, { activeTab, setActiveTab, unreadCounts, activityUnread })
   );
 }
 
@@ -1179,11 +1926,13 @@ function Header({ profile, connectionStatus, connectedPeersCount, onReconnect })
 
 // ========================== BOTTOM NAV ==========================
 
-function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
+function BottomNav({ activeTab, setActiveTab, unreadCounts, activityUnread }) {
   const tabs = [
     { id: 'chat', label: 'Chat' },
     { id: 'map', label: 'Map' },
+    { id: 'feed', label: 'Feed' },
     { id: 'geochat', label: 'Geochat' },
+    { id: 'activity', label: 'Activity' },
     { id: 'settings', label: 'Settings' },
   ];
 
@@ -1205,13 +1954,11 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
         opacity: activeTab === tab.id ? 1 : 0.5,
       }
     },
-      tab.id === 'chat' && totalUnread > 0 && e('span', {
-        style: {
-          position: 'absolute', top: 6, right: 16, background: 'var(--magenta)', color: '#fff',
-          fontSize: 9, fontWeight: 700, borderRadius: 10, padding: '1px 5px', minWidth: 16, textAlign: 'center',
-        }
-      }, totalUnread > 9 ? '9+' : totalUnread),
-      e('span', { style: { fontSize: 11, fontWeight: 600, color: activeTab === tab.id ? 'var(--accent)' : 'var(--text-secondary)', letterSpacing: 0.4 } }, tab.label),
+      e('span', { className: 'tab-label', style: { fontSize: 11, fontWeight: 600, color: activeTab === tab.id ? 'var(--accent)' : 'var(--text-secondary)', letterSpacing: 0.4 } },
+        tab.label,
+        tab.id === 'chat' && totalUnread > 0 && e('span', { className: 'tab-dot' }),
+        tab.id === 'activity' && activityUnread > 0 && e('span', { className: 'tab-dot tab-dot-amber' }),
+      ),
       activeTab === tab.id && e('div', { className: 'tab-indicator' }),
     ))
   );
@@ -1219,12 +1966,15 @@ function BottomNav({ activeTab, setActiveTab, unreadCounts }) {
 
 // ========================== CHAT VIEW ==========================
 
-function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, unreadCounts, setUnreadCounts, blips, categories }) {
+function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setActiveChatPeer, connectToPeer, sendToPeer, sendReliableToPeer, toggleLocationShare, removePeer, blockPeer, buzzPeer, logActivity, unreadCounts, setUnreadCounts, blips, categories, setActiveTab }) {
   const [connectInput, setConnectInput] = useState('');
   const [showConnect, setShowConnect] = useState(false);
   const [showQR, setShowQR] = useState(false);
   const [showScanner, setShowScanner] = useState(false);
   const [chatInput, setChatInput] = useState('');
+  const [showPeerMenu, setShowPeerMenu] = useState(false);
+  const [confirmState, setConfirmState] = useState(null);
+  const [peerListLimit, setPeerListLimit] = useState(30);
   const messagesEndRef = useRef(null);
 
   useEffect(() => {
@@ -1237,7 +1987,10 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
     if (activeChatPeer) {
       setUnreadCounts(prev => ({ ...prev, [activeChatPeer]: 0 }));
     }
+    setShowPeerMenu(false);
+    setConfirmState(null);
   }, [activeChatPeer]);
+
 
   function handleConnect() {
     const id = connectInput.trim();
@@ -1255,8 +2008,10 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
     const msg = { id: generateId('msg'), text, sender: profile.peerId, timestamp: Date.now(), deliveryId, delivered: false };
     setMessages(prev => ({ ...prev, [activeChatPeer]: [...(prev[activeChatPeer] || []), msg] }));
     sendReliableToPeer(activeChatPeer, { type: 'chat', message: text, timestamp: msg.timestamp, deliveryId });
+    if (logActivity) logActivity({ type: 'chat_out', title: 'Message', peerId: activeChatPeer });
     setChatInput('');
   }
+
 
   function handleShareVia(method) {
     const peerId = profile.peerId;
@@ -1379,18 +2134,19 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
       // Conversations
       e('div', { style: { flex: 1, overflow: 'auto', padding: '8px 16px' } },
         peers.length === 0 && e('div', { style: { textAlign: 'center', padding: 40, color: 'var(--text-secondary)' } },
-          e('div', { style: { fontSize: 48, marginBottom: 12 } }, '📡'),
+          e('div', { style: { fontSize: 48, marginBottom: 12 } }, '🤝'),
           e('div', { style: { fontSize: 15, fontWeight: 500 } }, 'No peers yet'),
           e('div', { style: { fontSize: 12, marginTop: 6 } }, 'Connect to a peer to start chatting'),
         ),
-        peers.map(peer => {
+        peers.slice(0, peerListLimit).map(peer => {
           const convMsgs = messages[peer.peerId] || [];
           const lastMsg = convMsgs[convMsgs.length - 1];
           const unread = unreadCounts[peer.peerId] || 0;
           const shareActive = !!peer.shareActive;
           const shareOut = !!peer.shareOut;
-          const shareLabel = shareActive ? 'Sharing' : shareOut ? 'Pending' : 'Share';
-          const shareTone = shareActive ? 'var(--neon-green)' : shareOut ? 'var(--amber)' : 'var(--text-secondary)';
+          const blocked = !!peer.blocked;
+          const shareLabel = blocked ? 'Blocked' : shareActive ? 'Sharing' : shareOut ? 'Pending' : 'Share';
+          const shareTone = blocked ? 'var(--magenta)' : shareActive ? 'var(--neon-green)' : shareOut ? 'var(--amber)' : 'var(--text-secondary)';
           return e('div', {
             key: peer.peerId,
             onClick: () => setActiveChatPeer(peer.peerId),
@@ -1402,7 +2158,7 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
             onMouseEnter: (ev) => { ev.currentTarget.style.borderColor = 'var(--accent)'; ev.currentTarget.style.boxShadow = '0 0 12px rgba(0,240,255,0.1)'; },
             onMouseLeave: (ev) => { ev.currentTarget.style.borderColor = 'var(--border)'; ev.currentTarget.style.boxShadow = 'none'; },
           },
-            e('div', { style: { width: 44, height: 44, borderRadius: '50%', background: 'var(--bg-card2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, flexShrink: 0, border: '2px solid ' + (peer.connected ? 'var(--neon-green)' : 'var(--border)') } }, peer.avatar || '👤'),
+            e('div', { style: { width: 44, height: 44, borderRadius: '50%', background: 'var(--bg-card2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 20, flexShrink: 0, border: '2px solid ' + (peer.connected ? 'var(--neon-green)' : 'var(--border)') } }, peer.avatar || '🙂'),
             e('div', { style: { flex: 1, minWidth: 0 } },
               e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
                 e('span', { style: { fontWeight: 600, fontSize: 14, color: 'var(--text-primary)' } }, peer.displayName || peer.peerId),
@@ -1412,37 +2168,164 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
                 e('span', { style: { fontSize: 12, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 200 } }, lastMsg ? lastMsg.text : (peer.connected ? 'Connected' : 'Offline')) ,
                 e('div', { style: { display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 } },
                   e('button', {
-                    onClick: (ev) => { ev.stopPropagation(); toggleLocationShare(peer.peerId, !shareOut); },
+                    onClick: (ev) => { ev.stopPropagation(); if (!blocked) toggleLocationShare(peer.peerId, !shareOut); },
                     className: 'boost-btn',
-                    style: { background: 'transparent', border: '1px solid ' + shareTone, color: shareTone, borderRadius: 999, padding: '2px 8px', fontSize: 10, fontWeight: 600, cursor: 'pointer' }
+                    style: { background: 'transparent', border: '1px solid ' + shareTone, color: shareTone, borderRadius: 999, padding: '2px 8px', fontSize: 10, fontWeight: 600, cursor: blocked ? 'not-allowed' : 'pointer', opacity: blocked ? 0.6 : 1 }
                   }, shareLabel),
                   unread > 0 && e('span', { style: { background: 'var(--magenta)', color: '#fff', fontSize: 10, fontWeight: 700, borderRadius: 10, padding: '2px 7px', minWidth: 18, textAlign: 'center' } }, unread),
                 ),
               ),
             ),
           );
-        })
+        }),
+        peers.length > peerListLimit && e('div', { style: { textAlign: 'center', padding: '12px 0' } },
+          e('button', {
+            onClick: () => setPeerListLimit(prev => prev + 30),
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 999, padding: '8px 14px', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }
+          }, 'Show More')
+        )
       )
     );
   }
 
   // Chat window
   const peerInfo = peers.find(p => p.peerId === activeChatPeer) || { peerId: activeChatPeer, displayName: activeChatPeer };
+  const peerBlocked = !!peerInfo.blocked;
   const convMsgs = messages[activeChatPeer] || [];
 
   return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column' } },
+    confirmState && e('div', {
+      style: { position: 'fixed', inset: 0, zIndex: 1300, display: 'flex', alignItems: 'center', justifyContent: 'center' }
+    },
+      e('div', { onClick: () => setConfirmState(null), style: { position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.6)' } }),
+      e('div', {
+        className: 'animate-bounce-in',
+        style: { position: 'relative', zIndex: 2, background: 'var(--bg-card)', borderRadius: 14, padding: 18, width: '90%', maxWidth: 360, border: '1px solid var(--border)' }
+      },
+        e('div', { style: { fontWeight: 700, fontSize: 16, marginBottom: 6, color: 'var(--text-primary)' } }, confirmState.title),
+        e('div', { style: { fontSize: 13, color: 'var(--text-secondary)', marginBottom: 14, lineHeight: 1.5 } }, confirmState.message),
+        e('div', { style: { display: 'flex', justifyContent: 'flex-end', gap: 8 } },
+          e('button', {
+            onClick: () => setConfirmState(null),
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 12px', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer' }
+          }, 'Cancel'),
+          e('button', {
+            onClick: () => { const action = confirmState.onConfirm; setConfirmState(null); if (action) action(); },
+            className: 'boost-btn',
+            style: { background: confirmState.danger ? 'var(--magenta)' : 'var(--accent)', border: '1px solid ' + (confirmState.danger ? 'var(--magenta)' : 'var(--accent)'), borderRadius: 8, padding: '8px 12px', color: 'var(--bg-deep)', fontSize: 12, cursor: 'pointer', fontWeight: 700 }
+          }, confirmState.confirmLabel || 'Confirm'),
+        ),
+      )
+    ),
+    showPeerMenu && e('div', {
+      onClick: () => setShowPeerMenu(false),
+      style: { position: 'fixed', inset: 0, zIndex: 1200 }
+    }),
     // Chat header
-    e('div', { style: { display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderBottom: '1px solid var(--border)', background: 'var(--glass-strong)', flexShrink: 0 } },
+    e('div', { style: { display: 'flex', alignItems: 'center', gap: 12, padding: '12px 16px', borderBottom: '1px solid var(--border)', background: 'var(--glass-strong)', flexShrink: 0, position: 'relative', zIndex: 1201 } },
       e('button', {
         onClick: () => setActiveChatPeer(null),
         style: { background: 'none', border: 'none', color: 'var(--accent)', fontSize: 20, cursor: 'pointer', padding: 4 }
       }, '←'),
-      e('div', { style: { width: 36, height: 36, borderRadius: '50%', background: 'var(--bg-card2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, border: '2px solid ' + (peerInfo.connected ? 'var(--neon-green)' : 'var(--border)') } }, peerInfo.avatar || '👤'),
+      e('div', { style: { width: 36, height: 36, borderRadius: '50%', background: 'var(--bg-card2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, border: '2px solid ' + (peerInfo.connected ? 'var(--neon-green)' : 'var(--border)') } }, peerInfo.avatar || '🙂'),
       e('div', null,
         e('div', { style: { fontWeight: 600, fontSize: 14 } }, peerInfo.displayName),
-        e('div', { style: { fontSize: 10, color: peerInfo.connected ? 'var(--neon-green)' : 'var(--text-secondary)' } }, peerInfo.connected ? 'Online' : 'Offline'),
+        e('div', { style: { fontSize: 10, color: peerBlocked ? 'var(--magenta)' : peerInfo.connected ? 'var(--neon-green)' : 'var(--text-secondary)' } },
+          peerBlocked ? 'Blocked' : (peerInfo.connected ? 'Online' : 'Offline'),
+          peerInfo.secure && e('span', { style: { marginLeft: 6, color: 'var(--accent)', fontWeight: 600 } }, 'Secure')
+        ),
+      ),
+      e('div', { style: { marginLeft: 'auto', position: 'relative' } },
+        e('button', {
+          onClick: () => setShowPeerMenu(v => !v),
+          className: 'boost-btn',
+          style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 10px', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer', fontWeight: 600 }
+        }, 'More'),
+        showPeerMenu && e('div', {
+          style: {
+            position: 'absolute', right: 0, top: 'calc(100% + 6px)', minWidth: 180,
+            background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10,
+            padding: 6, boxShadow: '0 12px 30px rgba(0,0,0,0.25)', display: 'flex', flexDirection: 'column', gap: 4,
+          }
+        },
+          e('button', {
+            onClick: () => { setShowPeerMenu(false); buzzPeer(activeChatPeer); },
+            className: 'boost-btn',
+            disabled: peerBlocked,
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--amber)', fontSize: 11, cursor: peerBlocked ? 'not-allowed' : 'pointer', fontWeight: 600, opacity: peerBlocked ? 0.5 : 1, textAlign: 'left' }
+          }, 'Buzz'),
+          peerInfo.shareActive && peerInfo.lastLoc && e('button', {
+            onClick: () => {
+              setShowPeerMenu(false);
+              if (peerInfo.lastLoc) {
+                setActiveTab('map');
+                setTimeout(() => {
+                  if (peerInfo.lastLoc) {
+                    window.__boost_open_route && window.__boost_open_route({
+                      lat: peerInfo.lastLoc.lat,
+                      lng: peerInfo.lastLoc.lng,
+                      label: peerInfo.displayName || peerInfo.peerId
+                    });
+                  }
+                }, 50);
+              }
+            },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--accent)', fontSize: 11, cursor: 'pointer', textAlign: 'left' }
+          }, 'Open on Map'),
+          e('div', { style: { height: 1, background: 'var(--border)', margin: '4px 0' } }),
+          e('button', {
+            onClick: () => {
+              setShowPeerMenu(false);
+              setConfirmState({
+                title: 'Remove Peer',
+                message: 'Remove this peer from your list?',
+                confirmLabel: 'Remove',
+                danger: false,
+                onConfirm: () => { removePeer(activeChatPeer, false); setActiveChatPeer(null); },
+              });
+            },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer', textAlign: 'left' }
+          }, 'Remove'),
+          e('button', {
+            onClick: () => {
+              setShowPeerMenu(false);
+              setConfirmState({
+                title: 'Remove & Delete History',
+                message: 'Remove this peer and delete all chat history and shared blips from them?',
+                confirmLabel: 'Remove & Delete',
+                danger: true,
+                onConfirm: () => { removePeer(activeChatPeer, true); setActiveChatPeer(null); },
+              });
+            },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--magenta)', borderRadius: 8, padding: '8px 10px', color: 'var(--magenta)', fontSize: 11, cursor: 'pointer', fontWeight: 600, textAlign: 'left' }
+          }, 'Remove & Delete'),
+          e('button', {
+            onClick: () => {
+              setShowPeerMenu(false);
+              if (peerBlocked) {
+                blockPeer(activeChatPeer, false);
+                return;
+              }
+              setConfirmState({
+                title: 'Block Peer',
+                message: 'Block this peer? They will not reconnect automatically and cannot buzz or chat with you.',
+                confirmLabel: 'Block',
+                danger: true,
+                onConfirm: () => blockPeer(activeChatPeer, true),
+              });
+            },
+            className: 'boost-btn',
+            style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px', color: 'var(--magenta)', fontSize: 11, cursor: 'pointer', textAlign: 'left' }
+          }, peerBlocked ? 'Unblock Peer' : 'Block Peer'),
+        ),
       ),
     ),
+
     // Messages
     e('div', { style: { flex: 1, overflow: 'auto', padding: '12px 16px', display: 'flex', flexDirection: 'column', gap: 6 } },
       convMsgs.length === 0 && e('div', { style: { textAlign: 'center', padding: 40, color: 'var(--text-secondary)', fontSize: 13 } }, 'No messages yet. Say hi! 👋'),
@@ -1465,26 +2348,638 @@ function ChatView({ profile, peers, messages, setMessages, activeChatPeer, setAc
       e('input', {
         value: chatInput, onChange: (ev) => setChatInput(ev.target.value),
         onKeyDown: (ev) => ev.key === 'Enter' && handleSend(),
-        placeholder: 'Type a message...',
-        style: { flex: 1, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 20, padding: '10px 16px', color: 'var(--text-primary)', fontSize: 14 }
+        placeholder: peerBlocked ? 'Peer is blocked' : 'Type a message...',
+        disabled: peerBlocked,
+        style: { flex: 1, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 20, padding: '10px 16px', color: 'var(--text-primary)', fontSize: 14, opacity: peerBlocked ? 0.6 : 1 }
       }),
       e('button', {
         onClick: handleSend,
         className: 'boost-btn',
-        style: { background: 'var(--accent)', color: 'var(--bg-deep)', border: 'none', borderRadius: '50%', width: 42, height: 42, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', fontSize: 18, fontWeight: 700 }
+        disabled: peerBlocked,
+        style: { background: 'var(--accent)', color: 'var(--bg-deep)', border: 'none', borderRadius: '50%', width: 42, height: 42, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: peerBlocked ? 'not-allowed' : 'pointer', fontSize: 18, fontWeight: 700, opacity: peerBlocked ? 0.6 : 1 }
       }, '⚡'),
+    )
+  );
+}
+
+// ========================== ACTIVITY VIEW ==========================
+
+function ActivityView({ activity, peers, onOpenActivity }) {
+  const peerMap = useMemo(() => {
+    const map = {};
+    (peers || []).forEach(p => { map[p.peerId] = p.displayName || p.peerId; });
+    return map;
+  }, [peers]);
+
+  const labelFor = (item) => {
+    const peerName = item.peerId ? (peerMap[item.peerId] || item.peerId) : '';
+    switch (item.type) {
+      case 'chat': return 'Message from ' + peerName;
+      case 'chat_out': return 'Message to ' + peerName;
+      case 'blip': return 'Blip from ' + peerName;
+      case 'comment': return 'Comment from ' + peerName;
+      case 'buzz': return 'Buzz from ' + peerName;
+      case 'connect': return 'Connected to ' + peerName;
+      case 'feed_post': return 'Post from ' + peerName;
+      case 'feed_reply': return 'Reply from ' + peerName;
+      case 'feed_reaction': return 'Reaction from ' + peerName;
+      default: return 'Activity';
+    }
+  };
+
+  const iconFor = (item) => {
+    switch (item.type) {
+      case 'chat':
+      case 'chat_out':
+        return '💬';
+      case 'blip':
+        return '📍';
+      case 'comment':
+        return '🗨️';
+      case 'buzz':
+        return '🔔';
+      case 'connect':
+        return '🤝';
+      case 'feed_post':
+        return '📰';
+      case 'feed_reply':
+        return '💬';
+      case 'feed_reaction':
+        return '✨';
+      default:
+        return '✨';
+    }
+  };
+
+  return e('div', { style: { height: '100%', overflow: 'auto', padding: '12px 16px' } },
+    activity.length === 0 && e('div', { style: { textAlign: 'center', padding: 40, color: 'var(--text-secondary)' } },
+      e('div', { style: { fontSize: 14, fontWeight: 600, marginBottom: 6 } }, 'No activity yet'),
+      e('div', { style: { fontSize: 12 } }, 'Chats, blips, and buzzes will show up here.')
+    ),
+    activity.map(item => e('div', {
+      key: item.id,
+      onClick: () => { if (item.action && onOpenActivity) onOpenActivity(item.action); },
+      style: {
+        background: 'var(--bg-card)', borderRadius: 12, padding: '12px 14px', marginBottom: 8,
+        border: '1px solid var(--border)', boxShadow: 'var(--shadow-soft)', cursor: item.action ? 'pointer' : 'default'
+      }
+    },
+      e('div', { style: { display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 } },
+        e('span', { style: { fontSize: 14 } }, iconFor(item)),
+        e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, labelFor(item)),
+      ),
+      item.title && item.title !== 'Message' && e('div', { style: { fontSize: 14, color: 'var(--text-primary)', fontWeight: 600 } }, item.title),
+      e('div', { style: { fontSize: 10, color: 'var(--text-secondary)', marginTop: 6 } }, timeAgo(item.ts))
+    ))
+  );
+}
+
+// ========================== FEED VIEW ==========================
+
+function FeedView({ position, posts, setPosts, geoPosts, setGeoPosts, profile, peers, sendReliableToAllPeers, settings, feedFocus, setFeedFocus, hiddenPosts, setHiddenPosts, mutedPeerIds, toggleMutePeer }) {
+  const [mode, setMode] = useState('peers');
+  const [text, setText] = useState('');
+  const [imageData, setImageData] = useState('');
+  const [imageName, setImageName] = useState('');
+  const [posting, setPosting] = useState(false);
+  const [showComposer, setShowComposer] = useState(false);
+  const [expiryMs, setExpiryMs] = useState(48 * 60 * 60 * 1000);
+  const [openReplies, setOpenReplies] = useState({});
+  const [replyDrafts, setReplyDrafts] = useState({});
+  const postRefs = useRef({});
+  const draftKey = 'boost_feed_draft_' + (mode || 'peers');
+  const hasDraft = !!((text && text.trim()) || imageData);
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
+  const MAX_LEN = 280;
+  const MAX_IMAGE_BYTES = 1500 * 1024;
+  const zoneRadius = settings.geochat.zoneRadius || 1000;
+  const zoneKey = position ? getZoneKey(position.lat, position.lng, zoneRadius) : null;
+  const zoneName = position ? getZoneName(position.lat, position.lng, zoneRadius) : 'Unknown Zone';
+  const peersSet = useMemo(() => new Set((peers || []).map(p => p.peerId)), [peers]);
+
+  const filteredPeersFeed = useMemo(() => {
+    return (posts || []).filter(p => (p.feed !== 'geofeed') && (p.senderId === profile.peerId || peersSet.has(p.senderId)));
+  }, [posts, peersSet, profile.peerId]);
+
+  const filteredMineFeed = useMemo(() => {
+    return (posts || []).filter(p => (p.feed !== 'geofeed') && p.senderId === profile.peerId);
+  }, [posts, profile.peerId]);
+
+  const filteredGeoFeed = useMemo(() => {
+    return (geoPosts || []).filter(p => {
+      if (p.feed && p.feed !== 'geofeed') return false;
+      if (p.senderId === profile.peerId) return true;
+      if (!settings.geochat.enabled) return false;
+      if (!zoneKey) return false;
+      return p.zoneKey === zoneKey;
+    });
+  }, [geoPosts, settings.geochat.enabled, zoneKey, profile.peerId]);
+
+  async function compressImage(file) {
+    if (!file) return '';
+    if (!window.createImageBitmap) {
+      return await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (e) => resolve(e.target.result || '');
+        reader.readAsDataURL(file);
+      });
+    }
+    const bitmap = await createImageBitmap(file);
+    const maxSize = 1280;
+    const scale = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL('image/jpeg', 0.75);
+  }
+
+  function handleImage(ev) {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      showToast('Only images supported', 'var(--amber)');
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      showToast('Image too large (max 1.5MB)', 'var(--amber)');
+      return;
+    }
+    compressImage(file).then((dataUrl) => {
+      if (!dataUrl) return;
+      if (dataUrl.length > 900000) {
+        showToast('Image too large after compression', 'var(--amber)');
+        return;
+      }
+      setImageData(dataUrl);
+      setImageName(file.name || 'image');
+    });
+  }
+
+  function clearImage() {
+    setImageData('');
+    setImageName('');
+  }
+
+  function closeComposer() {
+    setShowComposer(false);
+    if ((text && text.trim()) || imageData) {
+      showToast('Draft saved', 'var(--neon-green)');
+    }
+  }
+
+  function handlePost() {
+    if (posting) return;
+    const cleanText = text.trim();
+    if (!cleanText && !imageData) {
+      showToast('Write something or add an image', 'var(--amber)');
+      return;
+    }
+    if (mode === 'geofeed') {
+      if (!settings.geochat.enabled) {
+        showToast('Enable Geochat to post to Geofeed', 'var(--magenta)');
+        return;
+      }
+      if (!position) {
+        showToast('Location required for Geofeed', 'var(--magenta)');
+        return;
+      }
+    }
+    setPosting(true);
+    const post = {
+      id: generateId('post'),
+      senderId: profile.peerId,
+      sender: profile.displayName || profile.peerId,
+      text: cleanText.slice(0, MAX_LEN),
+      image: imageData || null,
+      imageName: imageName || null,
+      timestamp: Date.now(),
+      expiresAt: expiryMs === 0 ? null : Date.now() + expiryMs,
+      feed: mode === 'geofeed' ? 'geofeed' : 'peers',
+      lat: position ? position.lat : null,
+      lng: position ? position.lng : null,
+      zoneKey: position ? getZoneKey(position.lat, position.lng, zoneRadius) : null,
+      zoneRadius,
+    };
+    if (mode === 'geofeed') {
+      setGeoPosts(prev => [post, ...prev].slice(0, 200));
+      sendReliableToAllPeers({ type: 'geofeed_post', post });
+      showToast(navigator.onLine ? 'Posted to Geofeed' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
+    } else {
+      setPosts(prev => [post, ...prev].slice(0, 200));
+      sendReliableToAllPeers({ type: 'post', post });
+      showToast(navigator.onLine ? 'Posted to Peers' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
+    }
+    setText('');
+    clearImage();
+    setShowComposer(false);
+    try { localStorage.removeItem(draftKey); } catch {}
+    setPosting(false);
+  }
+
+  function addReaction(postId, reaction, feedType) {
+    if (!postId || !reaction) return;
+    const targetFeed = feedType || (mode === 'geofeed' ? 'geofeed' : 'peers');
+    const updater = (p) => {
+      const reactionsBy = { ...(p.reactionsBy || {}) };
+      const prev = reactionsBy[profile.peerId];
+      if (prev === reaction) {
+        delete reactionsBy[profile.peerId];
+      } else {
+        reactionsBy[profile.peerId] = reaction;
+      }
+      return { ...p, reactionsBy, reactions: buildReactionCounts(reactionsBy) };
+    };
+    if (targetFeed === 'geofeed') setGeoPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    else setPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    sendReliableToAllPeers({ type: 'post_reaction', feed: targetFeed, postId, reaction, senderId: profile.peerId, senderName: profile.displayName });
+  }
+
+  function addReply(postId, feedType) {
+    const text = (replyDrafts[postId] || '').trim();
+    if (!text) return;
+    const targetFeed = feedType || (mode === 'geofeed' ? 'geofeed' : 'peers');
+    const reply = {
+      id: generateId('reply'),
+      senderId: profile.peerId,
+      sender: profile.displayName || profile.peerId,
+      text: text.slice(0, MAX_LEN),
+      timestamp: Date.now(),
+    };
+    const updater = (p) => {
+      const replies = p.replies || [];
+      return { ...p, replies: [...replies, reply] };
+    };
+    if (targetFeed === 'geofeed') setGeoPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    else setPosts(prev => prev.map(p => p.id === postId ? updater(p) : p));
+    sendReliableToAllPeers({ type: 'post_reply', feed: targetFeed, postId, reply });
+    setReplyDrafts(prev => ({ ...prev, [postId]: '' }));
+    setOpenReplies(prev => ({ ...prev, [postId]: true }));
+  }
+
+  function handleRepost(item) {
+    if (!item) return;
+    const targetFeed = item.feed === 'geofeed' ? 'geofeed' : 'peers';
+    if (targetFeed === 'geofeed') {
+      if (!settings.geochat.enabled) {
+        showToast('Enable Geochat to repost to Geofeed', 'var(--magenta)');
+        return;
+      }
+      if (!position) {
+        showToast('Location required for Geofeed', 'var(--magenta)');
+        return;
+      }
+    }
+    const repost = {
+      id: generateId('post'),
+      senderId: profile.peerId,
+      sender: profile.displayName || profile.peerId,
+      text: '',
+      image: null,
+      imageName: null,
+      repostOf: { id: item.id, sender: item.sender, text: item.text || '' },
+      timestamp: Date.now(),
+      expiresAt: Date.now() + 48 * 60 * 60 * 1000,
+      feed: targetFeed,
+      lat: position ? position.lat : null,
+      lng: position ? position.lng : null,
+      zoneKey: position ? getZoneKey(position.lat, position.lng, zoneRadius) : null,
+      zoneRadius,
+    };
+    if (targetFeed === 'geofeed') {
+      setGeoPosts(prev => [repost, ...prev].slice(0, 200));
+      sendReliableToAllPeers({ type: 'geofeed_post', post: repost });
+      showToast(navigator.onLine ? 'Reposted to Geofeed' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
+    } else {
+      setPosts(prev => [repost, ...prev].slice(0, 200));
+      sendReliableToAllPeers({ type: 'post', post: repost });
+      showToast(navigator.onLine ? 'Reposted to Peers' : 'Queued for delivery', navigator.onLine ? 'var(--neon-green)' : 'var(--amber)');
+    }
+  }
+
+  function hidePost(postId) {
+    if (!postId) return;
+    setHiddenPosts(prev => prev.includes(postId) ? prev : [...prev, postId]);
+    showToast('Post hidden', 'var(--amber)');
+  }
+
+  function deletePost(item) {
+    if (!item) return;
+    setDeleteConfirm({
+      title: 'Delete Post',
+      message: 'Delete this post for everyone? This cannot be undone.',
+      onConfirm: () => {
+        const feed = item.feed === 'geofeed' ? 'geofeed' : 'peers';
+        if (feed === 'geofeed') {
+          setGeoPosts(prev => prev.filter(p => p.id !== item.id));
+        } else {
+          setPosts(prev => prev.filter(p => p.id !== item.id));
+        }
+        sendReliableToAllPeers({ type: 'post_delete', feed, postId: item.id });
+        showToast('Post deleted', 'var(--amber)');
+      }
+    });
+    return;
+  }
+
+  const hiddenSet = useMemo(() => new Set(hiddenPosts || []), [hiddenPosts]);
+  const feedItems = (mode === 'geofeed' ? filteredGeoFeed : mode === 'mine' ? filteredMineFeed : filteredPeersFeed)
+    .filter(p => !p.expiresAt || p.expiresAt > Date.now())
+    .filter(p => !hiddenSet.has(p.id))
+    .filter(p => !mutedPeerIds || p.senderId === profile.peerId || !mutedPeerIds.has(p.senderId));
+
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(draftKey) || 'null');
+      if (saved && typeof saved === 'object') {
+        if (typeof saved.text === 'string') setText(saved.text);
+        if (typeof saved.imageData === 'string') setImageData(saved.imageData);
+        if (typeof saved.imageName === 'string') setImageName(saved.imageName);
+        if (typeof saved.expiryMs === 'number') setExpiryMs(saved.expiryMs);
+      }
+    } catch {}
+  }, [draftKey]);
+
+  useEffect(() => {
+    const payload = { text, imageData, imageName, expiryMs, ts: Date.now() };
+    try { localStorage.setItem(draftKey, JSON.stringify(payload)); } catch {}
+  }, [draftKey, text, imageData, imageName, expiryMs]);
+
+  useEffect(() => {
+    if (!feedFocus || !feedFocus.postId) return;
+    if (feedFocus.mode) setMode(feedFocus.mode);
+    if (feedFocus.openReplies) {
+      setOpenReplies(prev => ({ ...prev, [feedFocus.postId]: true }));
+    }
+    const el = postRefs.current[feedFocus.postId];
+    if (el && el.scrollIntoView) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+    if (setFeedFocus) setFeedFocus(null);
+  }, [feedFocus, feedItems.length, setFeedFocus]);
+
+  return e('div', { style: { height: '100%', display: 'flex', flexDirection: 'column', padding: 14, gap: 12, overflow: 'hidden', position: 'relative' } },
+    e('div', { style: { display: 'flex', gap: 8 } },
+      e('button', {
+        onClick: () => setMode('peers'),
+        className: 'boost-btn',
+        style: {
+          flex: 1, padding: '8px 12px', borderRadius: 999, border: '1px solid var(--border)',
+          background: mode === 'peers' ? 'var(--bg-card2)' : 'transparent',
+          color: mode === 'peers' ? 'var(--accent)' : 'var(--text-secondary)', fontWeight: 600, fontSize: 12
+        }
+      }, 'Peers'),
+      e('button', {
+        onClick: () => setMode('mine'),
+        className: 'boost-btn',
+        style: {
+          flex: 1, padding: '8px 12px', borderRadius: 999, border: '1px solid var(--border)',
+          background: mode === 'mine' ? 'var(--bg-card2)' : 'transparent',
+          color: mode === 'mine' ? 'var(--accent)' : 'var(--text-secondary)', fontWeight: 600, fontSize: 12
+        }
+      }, 'My Posts'),
+      e('button', {
+        onClick: () => setMode('geofeed'),
+        className: 'boost-btn',
+        style: {
+          flex: 1, padding: '8px 12px', borderRadius: 999, border: '1px solid var(--border)',
+          background: mode === 'geofeed' ? 'var(--bg-card2)' : 'transparent',
+          color: mode === 'geofeed' ? 'var(--accent)' : 'var(--text-secondary)', fontWeight: 600, fontSize: 12
+        }
+      }, 'Geofeed'),
+    ),
+    e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: -4 } },
+      mode === 'geofeed'
+        ? 'Geofeed is public to peers in your zone.'
+        : mode === 'mine'
+          ? 'My Posts are visible to peers you connected with.'
+          : 'Peers feed is private between you and your peers.'
+    ),
+    e('div', { style: { flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, paddingRight: 2 } },
+      feedItems.length === 0 && e('div', { style: { padding: 16, textAlign: 'center', color: 'var(--text-secondary)', fontSize: 12 } },
+        mode === 'geofeed' ? 'No geofeed posts yet.' : mode === 'mine' ? 'No posts yet.' : 'No peer posts yet.'
+      ),
+      feedItems.map(item => e('div', {
+        key: item.id,
+        ref: (el) => { postRefs.current[item.id] = el; },
+        style: { background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 16, padding: 12, display: 'flex', flexDirection: 'column', gap: 8 }
+      },
+        e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } },
+          e('div', { style: { fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' } }, item.sender || 'Peer'),
+          e('div', { style: { display: 'flex', alignItems: 'center', gap: 6 } },
+            e('span', { style: { fontSize: 9, color: 'var(--text-secondary)', border: '1px solid var(--border)', padding: '2px 6px', borderRadius: 999 } },
+              item.feed === 'geofeed' ? 'Public' : 'Private'
+            ),
+            e('span', { style: { fontSize: 10, color: 'var(--text-secondary)' } }, timeAgo(item.timestamp))
+          )
+        ),
+        item.repostOf && e('div', { style: { borderLeft: '3px solid var(--border)', paddingLeft: 8, fontSize: 12, color: 'var(--text-secondary)' } },
+          e('div', { style: { fontWeight: 700, fontSize: 11, marginBottom: 2 } }, 'Repost · ' + (item.repostOf.sender || 'Peer')),
+          e('div', { style: { whiteSpace: 'pre-wrap' } }, item.repostOf.text || '')
+        ),
+        item.text && e('div', { style: { fontSize: 13, color: 'var(--text-primary)', lineHeight: 1.4, whiteSpace: 'pre-wrap' } }, item.text),
+        item.image && e('img', { src: item.image, alt: item.imageName || 'post image', style: { width: '100%', maxHeight: 260, objectFit: 'cover', borderRadius: 12, border: '1px solid var(--border)' } }),
+        mode === 'geofeed' && item.zoneKey && e('div', { style: { fontSize: 10, color: 'var(--text-secondary)' } },
+          item.zoneKey === zoneKey ? 'In your zone' : 'Nearby zone'
+        ),
+        e('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 } },
+          e('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+            ['👍', '🔥', '😂', '😮', '😢'].map(rx => {
+              const isMine = item.reactionsBy && item.reactionsBy[profile.peerId] === rx;
+              return e('button', {
+                key: rx,
+                onClick: () => addReaction(item.id, rx, item.feed === 'geofeed' ? 'geofeed' : 'peers'),
+                className: 'boost-btn',
+                style: {
+                  border: '1px solid ' + (isMine ? 'var(--accent)' : 'var(--border)'),
+                  background: isMine ? 'var(--accent)' : 'var(--bg-card2)',
+                  borderRadius: 999, padding: '4px 8px', fontSize: 12, cursor: 'pointer',
+                  color: isMine ? '#fff' : 'var(--text-primary)'
+                }
+              }, rx + (item.reactions && item.reactions[rx] ? ' ' + item.reactions[rx] : ''));
+            })
+          ),
+          e('div', { style: { display: 'flex', gap: 6 } },
+            e('button', {
+              onClick: () => handleRepost(item),
+              className: 'boost-btn',
+              style: { border: '1px solid var(--border)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--text-secondary)' }
+            }, 'Repost'),
+            e('button', {
+              onClick: () => setOpenReplies(prev => ({ ...prev, [item.id]: !prev[item.id] })),
+              className: 'boost-btn',
+              style: { border: '1px solid var(--border)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--text-secondary)' }
+            }, (item.replies && item.replies.length ? item.replies.length + ' Replies' : 'Reply'))
+          )
+        ),
+        item.senderId && item.senderId !== profile.peerId && e('div', { style: { display: 'flex', gap: 8, marginTop: 2 } },
+          e('button', {
+            onClick: () => hidePost(item.id),
+            className: 'boost-btn',
+            style: { border: '1px solid var(--border)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--text-secondary)' }
+          }, 'Hide'),
+          e('button', {
+            onClick: () => toggleMutePeer(item.senderId, !(mutedPeerIds && mutedPeerIds.has(item.senderId))),
+            className: 'boost-btn',
+            style: { border: '1px solid var(--border)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--text-secondary)' }
+          }, (mutedPeerIds && mutedPeerIds.has(item.senderId)) ? 'Unmute' : 'Mute')
+        ),
+        item.senderId === profile.peerId && e('div', { style: { display: 'flex', gap: 8, marginTop: 2 } },
+          e('button', {
+            onClick: () => deletePost(item),
+            className: 'boost-btn',
+            style: { border: '1px solid var(--magenta)', background: 'transparent', borderRadius: 8, padding: '4px 10px', fontSize: 11, cursor: 'pointer', color: 'var(--magenta)' }
+          }, 'Delete')
+        ),
+        openReplies[item.id] && e('div', { style: { marginTop: 6, display: 'flex', flexDirection: 'column', gap: 6 } },
+          (item.replies || []).map(r => e('div', {
+            key: r.id,
+            style: { borderLeft: '2px solid var(--border)', paddingLeft: 8, fontSize: 12, color: 'var(--text-primary)' }
+          },
+            e('div', { style: { fontWeight: 700, fontSize: 11, marginBottom: 2 } }, r.sender || 'Peer'),
+            e('div', { style: { whiteSpace: 'pre-wrap' } }, r.text),
+            e('div', { style: { fontSize: 9, color: 'var(--text-secondary)', marginTop: 2 } }, timeAgo(r.timestamp))
+          )),
+          e('div', { style: { display: 'flex', gap: 8, marginTop: 4 } },
+            e('input', {
+              value: replyDrafts[item.id] || '',
+              onChange: (ev) => setReplyDrafts(prev => ({ ...prev, [item.id]: ev.target.value })),
+              placeholder: 'Write a reply...',
+              style: { flex: 1, background: 'var(--bg-deep)', border: '1px solid var(--border)', borderRadius: 999, padding: '6px 12px', color: 'var(--text-primary)', fontSize: 12 }
+            }),
+            e('button', {
+              onClick: () => addReply(item.id, item.feed === 'geofeed' ? 'geofeed' : 'peers'),
+              className: 'boost-btn',
+              style: { border: '1px solid var(--border)', background: 'var(--accent)', color: '#fff', borderRadius: 999, padding: '6px 12px', fontSize: 11, fontWeight: 700, cursor: 'pointer' }
+            }, 'Send')
+          )
+        )
+      ))
+    ),
+    e('button', {
+      onClick: () => setShowComposer(true),
+      className: 'boost-btn',
+      style: {
+        position: 'absolute', right: 16, bottom: 16, zIndex: 5,
+        background: 'var(--accent)', color: '#fff', border: 'none',
+        borderRadius: 999, padding: '10px 16px', fontWeight: 700, fontSize: 12, cursor: 'pointer',
+        boxShadow: 'var(--shadow-soft)'
+      }
+    }, 'Post' + (hasDraft ? ' · Draft' : '')),
+    showComposer && e('div', {
+      onClick: () => closeComposer(),
+      style: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 10, display: 'flex', alignItems: 'flex-end', padding: 12 }
+    },
+      e('div', {
+        onClick: (ev) => ev.stopPropagation(),
+        style: {
+          width: '100%', maxHeight: '80%', overflow: 'auto', background: 'var(--bg-card)',
+          border: '1px solid var(--border)', borderRadius: 16, padding: 12, boxShadow: 'var(--shadow-strong)'
+        }
+      },
+        e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 } },
+          e('div', { style: { fontSize: 13, fontWeight: 700, color: 'var(--text-primary)' } }, mode === 'geofeed' ? 'Post to Geofeed' : 'Post to Peers'),
+          e('button', {
+            onClick: () => closeComposer(),
+            className: 'boost-btn',
+            style: { background: 'transparent', border: '1px solid var(--border)', borderRadius: 8, padding: '4px 8px', fontSize: 11, color: 'var(--text-secondary)', cursor: 'pointer' }
+          }, 'Close')
+        ),
+        e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6 } },
+          mode === 'geofeed'
+            ? ('Posting to ' + zoneName + ' · ' + (zoneRadius >= 1000 ? (zoneRadius / 1000) + 'km' : zoneRadius + 'm'))
+            : 'Posting to your peers'
+        ),
+        e('textarea', {
+          value: text,
+          onChange: (ev) => setText(ev.target.value.slice(0, MAX_LEN)),
+          placeholder: mode === 'geofeed' ? 'Share something for your zone...' : 'Share something with your peers...',
+          style: {
+            width: '100%', minHeight: 90, resize: 'none', borderRadius: 12, border: '1px solid var(--border)',
+            background: 'var(--bg-deep)', color: 'var(--text-primary)', padding: 10, fontSize: 13, outline: 'none'
+          }
+        }),
+        e('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 8 } },
+          e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, (text.length || 0) + '/' + MAX_LEN),
+          e('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+            e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, 'Expires'),
+            e('select', {
+              value: String(expiryMs),
+              onChange: (ev) => setExpiryMs(parseInt(ev.target.value)),
+              style: { background: 'var(--bg-deep)', color: 'var(--text-primary)', border: '1px solid var(--border)', borderRadius: 8, padding: '4px 8px', fontSize: 11 }
+            },
+              e('option', { value: String(6 * 60 * 60 * 1000) }, '6h'),
+              e('option', { value: String(12 * 60 * 60 * 1000) }, '12h'),
+              e('option', { value: String(24 * 60 * 60 * 1000) }, '24h'),
+              e('option', { value: String(48 * 60 * 60 * 1000) }, '48h'),
+              e('option', { value: String(7 * 24 * 60 * 60 * 1000) }, '7d'),
+              e('option', { value: '0' }, 'Never')
+            )
+          )
+        ),
+        imageData && e('div', { style: { marginTop: 10, position: 'relative' } },
+          e('img', { src: imageData, alt: imageName || 'post image', style: { width: '100%', maxHeight: 220, objectFit: 'cover', borderRadius: 12, border: '1px solid var(--border)' } }),
+          e('button', {
+            onClick: clearImage,
+            className: 'boost-btn',
+            style: { position: 'absolute', top: 8, right: 8, background: 'rgba(0,0,0,0.6)', color: '#fff', border: 'none', borderRadius: 8, padding: '4px 8px', fontSize: 11, cursor: 'pointer' }
+          }, 'Remove')
+        ),
+        e('div', { style: { display: 'flex', gap: 8, marginTop: 10, alignItems: 'center' } },
+          e('label', { className: 'boost-btn', style: { padding: '8px 12px', borderRadius: 8, border: '1px solid var(--border)', color: 'var(--text-secondary)', cursor: 'pointer', fontSize: 12, background: 'var(--bg-card2)' } },
+            'Add Image',
+            e('input', { type: 'file', accept: 'image/*', onChange: handleImage, style: { display: 'none' } })
+          ),
+          imageName && e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 140 } }, imageName),
+          e('div', { style: { flex: 1 } }),
+          e('button', {
+            onClick: handlePost,
+            className: 'boost-btn',
+            style: { padding: '8px 14px', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--accent)', color: '#fff', fontWeight: 700, fontSize: 12, cursor: 'pointer', opacity: posting ? 0.6 : 1 }
+          }, 'Post')
+        )
+      )
+    )
+    ,
+    deleteConfirm && e('div', {
+      onClick: () => setDeleteConfirm(null),
+      style: { position: 'absolute', inset: 0, background: 'rgba(0,0,0,0.55)', zIndex: 12, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 16 }
+    },
+      e('div', {
+        onClick: (ev) => ev.stopPropagation(),
+        style: { width: '100%', maxWidth: 360, background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 14, padding: 16, boxShadow: 'var(--shadow-strong)' }
+      },
+        e('div', { style: { fontSize: 14, fontWeight: 700, marginBottom: 6, color: 'var(--text-primary)' } }, deleteConfirm.title),
+        e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 12 } }, deleteConfirm.message),
+        e('div', { style: { display: 'flex', gap: 8, justifyContent: 'flex-end' } },
+          e('button', {
+            onClick: () => setDeleteConfirm(null),
+            className: 'boost-btn',
+            style: { border: '1px solid var(--border)', background: 'transparent', color: 'var(--text-secondary)', borderRadius: 8, padding: '6px 10px', fontSize: 12, cursor: 'pointer' }
+          }, 'Cancel'),
+          e('button', {
+            onClick: () => { deleteConfirm.onConfirm && deleteConfirm.onConfirm(); setDeleteConfirm(null); },
+            className: 'boost-btn',
+            style: { border: '1px solid var(--magenta)', background: 'var(--magenta)', color: '#fff', borderRadius: 8, padding: '6px 10px', fontSize: 12, cursor: 'pointer', fontWeight: 700 }
+          }, 'Delete')
+        )
+      )
     )
   );
 }
 
 // ========================== MAP VIEW ==========================
 
-function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPeer, settings, peers, categories }) {
+function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPeer, sendReliableToAllPeers, settings, peers, categories, logActivity }) {
   const mapContainerRef = useRef(null);
   const leafletMapRef = useRef(null);
   const userMarkerRef = useRef(null);
   const blipLayerRef = useRef(null);
+  const blipMarkersRef = useRef({});
   const peerLayerRef = useRef(null);
+  const peerMarkersRef = useRef({});
+  const peerBadgesRef = useRef({});
   const routeLayerRef = useRef(null);
   const routeAbortRef = useRef(null);
   const lastRouteKeyRef = useRef(null);
@@ -1499,6 +2994,9 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const [routeLoading, setRouteLoading] = useState(false);
   const [routeActive, setRouteActive] = useState(false);
   const [awaitingMapPick, setAwaitingMapPick] = useState(false);
+  const [blipListLimit, setBlipListLimit] = useState(8);
+  const [tileError, setTileError] = useState(false);
+  const [routeError, setRouteError] = useState(false);
   const allCategories = categories && categories.length ? categories : BLIP_CATEGORIES;
 
   function buildAltRoute(start, end) {
@@ -1537,7 +3035,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     L.control.zoom({ position: 'bottomleft' }).addTo(map);
 
     const theme = (settings.ui && settings.ui.theme) || 'obsidian';
-    const lightThemes = ['ivory', 'sand'];
+    const lightThemes = ['paper', 'pastel', 'desert', 'ivory'];
     const tileUrl = lightThemes.includes(theme)
       ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
       : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
@@ -1545,6 +3043,8 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
       subdomains: 'abcd', maxZoom: 20,
     }).addTo(map);
+    tileLayerRef.current.on('tileerror', () => setTileError(true));
+    tileLayerRef.current.on('load', () => setTileError(false));
 
     blipLayerRef.current = L.layerGroup().addTo(map);
     peerLayerRef.current = L.layerGroup().addTo(map);
@@ -1557,7 +3057,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   useEffect(() => {
     if (!leafletMapRef.current) return;
     const theme = (settings.ui && settings.ui.theme) || 'obsidian';
-    const lightThemes = ['ivory', 'sand'];
+    const lightThemes = ['paper', 'pastel', 'desert', 'ivory'];
     const tileUrl = lightThemes.includes(theme)
       ? 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png'
       : 'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png';
@@ -1568,6 +3068,8 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/">CARTO</a>',
       subdomains: 'abcd', maxZoom: 20,
     }).addTo(leafletMapRef.current);
+    tileLayerRef.current.on('tileerror', () => setTileError(true));
+    tileLayerRef.current.on('load', () => setTileError(false));
   }, [settings.ui && settings.ui.theme]);
 
   // Update user position
@@ -1604,6 +3106,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     if (!routeTarget || !position) {
       setRouteData(null);
       setRouteLoading(false);
+      setRouteError(false);
       lastRouteKeyRef.current = null;
       return;
     }
@@ -1625,18 +3128,22 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     const end = routeTarget.lng + ',' + routeTarget.lat;
     const url = 'https://router.project-osrm.org/route/v1/driving/' + start + ';' + end + '?overview=full&geometries=geojson&alternatives=true&steps=false';
     setRouteLoading(true);
+    setRouteError(false);
     fetch(url, { signal: controller.signal })
       .then(res => res.json())
       .then(data => {
         if (data && data.routes && data.routes.length) {
           setRouteData(data);
+          setRouteError(false);
         } else {
           setRouteData(null);
+          setRouteError(true);
         }
       })
       .catch(err => {
         if (err && err.name === 'AbortError') return;
         setRouteData(null);
+        setRouteError(true);
         showToast('Routing unavailable', 'var(--amber)');
       })
       .finally(() => setRouteLoading(false));
@@ -1645,10 +3152,14 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   // Update blips on map
   useEffect(() => {
     if (!blipLayerRef.current) return;
-    blipLayerRef.current.clearLayers();
-
+    const layer = blipLayerRef.current;
+    const markers = blipMarkersRef.current;
     const hidden = settings.map.hiddenCategories || [];
-    blips.filter(b => !hidden.includes(b.type)).forEach(blip => {
+    const visible = blips.filter(b => !hidden.includes(b.type));
+    const activeIds = new Set();
+
+    visible.forEach(blip => {
+      activeIds.add(blip.id);
       const cat = getCat(blip.type, allCategories);
       const isExpiring = blip.expiresAt && (blip.expiresAt - Date.now()) < 3600000;
       const isMine = blip.creator === profile.peerId;
@@ -1659,45 +3170,116 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         iconSize: [36, 36], iconAnchor: [18, 18],
       });
 
-      const marker = L.marker([blip.lat, blip.lng], { icon, draggable: isMine }).addTo(blipLayerRef.current);
-
-      // Drag support for own blips
-      if (isMine) {
-        marker.on('dragend', function(ev) {
-          const newPos = ev.target.getLatLng();
-          setBlips(prev => prev.map(b => {
-            if (b.id === blip.id) {
-              const updated = { ...b, lat: newPos.lat, lng: newPos.lng };
-              sendToAllPeers({ type: 'blip_update', blip: updated });
-              return updated;
-            }
-            return b;
-          }));
-          showToast('📍 Blip moved!', 'var(--neon-green)');
+      let marker = markers[blip.id];
+      if (!marker) {
+        marker = L.marker([blip.lat, blip.lng], { icon, draggable: isMine }).addTo(layer);
+        marker.on('click', function() {
+          setSelectedBlip(blip.id);
         });
+        if (isMine) {
+          marker.on('dragend', function(ev) {
+            const newPos = ev.target.getLatLng();
+            setBlips(prev => prev.map(b => {
+              if (b.id === blip.id) {
+                const updated = { ...b, lat: newPos.lat, lng: newPos.lng };
+                sendToAllPeers({ type: 'blip_update', blip: updated });
+                return updated;
+              }
+              return b;
+            }));
+            showToast('📍 Blip moved!', 'var(--neon-green)');
+          });
+        }
+        markers[blip.id] = marker;
+      } else {
+        marker.setLatLng([blip.lat, blip.lng]);
+        marker.setIcon(icon);
       }
+    });
 
-      // Click to open detail
-      marker.on('click', function() {
-        setSelectedBlip(blip.id);
-      });
+    Object.keys(markers).forEach(id => {
+      if (!activeIds.has(id)) {
+        layer.removeLayer(markers[id]);
+        delete markers[id];
+      }
     });
   }, [blips, settings.map.hiddenCategories]);
 
   useEffect(() => {
     if (!peerLayerRef.current) return;
-    peerLayerRef.current.clearLayers();
+    const layer = peerLayerRef.current;
+    const markers = peerMarkersRef.current;
+
+    function animateMarker(marker, from, to, duration = 900) {
+      const start = performance.now();
+      function step(now) {
+        const t = Math.min(1, (now - start) / duration);
+        const lat = from.lat + (to.lat - from.lat) * t;
+        const lng = from.lng + (to.lng - from.lng) * t;
+        marker.setLatLng([lat, lng]);
+        if (t < 1) requestAnimationFrame(step);
+      }
+      requestAnimationFrame(step);
+    }
+
+    const activeIds = new Set();
     peers.filter(p => p.shareActive && p.lastLoc).forEach(p => {
+      activeIds.add(p.peerId);
       const color = colorFromId(p.peerId);
-      const marker = L.circleMarker([p.lastLoc.lat, p.lastLoc.lng], {
-        radius: 8,
-        color,
-        weight: 2,
-        fillColor: color,
-        fillOpacity: 0.6,
-      });
-      marker.bindTooltip(p.displayName || p.peerId, { direction: 'top', offset: [0, -8], opacity: 0.9 });
-      peerLayerRef.current.addLayer(marker);
+      const target = L.latLng(p.lastLoc.lat, p.lastLoc.lng);
+      const lastSeen = p.lastSeen || 0;
+      const lastLocAt = p.lastLocAt || 0;
+      const locStale = lastLocAt && (Date.now() - lastLocAt > LOC_STALE_MS);
+      const name = p.displayName || p.peerId;
+      const tooltipHtml = [
+        '<div style="font-weight:700;font-size:12px;margin-bottom:2px;">' + name + '</div>',
+        '<div style="font-size:10px;opacity:0.8;">Seen ' + (lastSeen ? timeAgo(lastSeen) : 'unknown') + '</div>',
+        '<div style="font-size:10px;opacity:0.8;">Location ' + (lastLocAt ? timeAgo(lastLocAt) : 'unknown') + (locStale ? ' · stale' : ' · live') + '</div>',
+      ].join('');
+      let marker = markers[p.peerId];
+      let badge = peerBadgesRef.current[p.peerId];
+      if (!marker) {
+        marker = L.circleMarker(target, {
+          radius: 8,
+          color,
+          weight: 2,
+          fillColor: color,
+          fillOpacity: 0.6,
+        });
+        marker.bindTooltip(tooltipHtml, { direction: 'top', offset: [0, -8], opacity: 0.95 });
+        marker.addTo(layer);
+        markers[p.peerId] = marker;
+      } else {
+        const from = marker.getLatLng();
+        animateMarker(marker, from, target);
+      }
+      if (!badge) {
+        const html = '<div class="peer-update-badge' + (locStale ? ' stale' : '') + '">' + (lastLocAt ? timeAgo(lastLocAt) : 'unknown') + '</div>';
+        badge = L.marker(target, {
+          interactive: false,
+          icon: L.divIcon({ className: 'peer-update-badge-wrap', html })
+        }).addTo(layer);
+        peerBadgesRef.current[p.peerId] = badge;
+      } else {
+        badge.setLatLng(target);
+        const html = '<div class="peer-update-badge' + (locStale ? ' stale' : '') + '">' + (lastLocAt ? timeAgo(lastLocAt) : 'unknown') + '</div>';
+        badge.setIcon(L.divIcon({ className: 'peer-update-badge-wrap', html }));
+      }
+      marker.setStyle({ color, fillColor: color, fillOpacity: locStale ? 0.2 : 0.6, opacity: locStale ? 0.6 : 1, weight: locStale ? 1 : 2 });
+      marker.setTooltipContent(tooltipHtml);
+    });
+
+    Object.keys(markers).forEach(pid => {
+      if (!activeIds.has(pid)) {
+        layer.removeLayer(markers[pid]);
+        delete markers[pid];
+      }
+    });
+    Object.keys(peerBadgesRef.current).forEach(pid => {
+      if (!activeIds.has(pid)) {
+        layer.removeLayer(peerBadgesRef.current[pid]);
+        delete peerBadgesRef.current[pid];
+      }
     });
   }, [peers]);
 
@@ -1752,6 +3334,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     };
 
     setBlips(prev => [...prev, blip]);
+    if (logActivity) logActivity({ type: 'blip', title: blip.title, peerId: profile.peerId });
 
     if (newBlip.shareWithPeers) {
       sendToAllPeers({ type: 'blip', blip });
@@ -1766,8 +3349,12 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
     setBlips(prev => prev.map(b => b.id === updated.id ? updated : b));
   }
 
-  function handleDeleteBlip(id) {
-    setBlips(prev => prev.filter(b => b.id !== id));
+  function handleDeleteBlip(blip) {
+    if (!blip) return;
+    setBlips(prev => prev.filter(b => b.id !== blip.id));
+    if (blip.creator === profile.peerId) {
+      sendReliableToAllPeers({ type: 'blip_delete', blipId: blip.id, creator: profile.peerId });
+    }
   }
 
   // Find selected blip data (fresh from state)
@@ -1775,6 +3362,14 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
   const hiddenCategories = settings.map.hiddenCategories || [];
   const visibleBlips = blips.filter(b => !hiddenCategories.includes(b.type));
   const sharePeers = peers.filter(p => p.shareActive && p.lastLoc);
+  useEffect(() => {
+    window.__boost_open_route = (target) => {
+      if (!target) return;
+      setRouteTarget({ lat: target.lat, lng: target.lng, label: target.label || 'Peer' });
+      setRouteActive(false);
+    };
+    return () => { if (window.__boost_open_route) delete window.__boost_open_route; };
+  }, []);
 
   const routeDistances = useMemo(() => {
     if (!routeTarget || !position) return null;
@@ -1791,6 +3386,13 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
 
   return e('div', { style: { height: '100%', position: 'relative' } },
     e('div', { ref: mapContainerRef, style: { width: '100%', height: '100%' } }),
+    (tileError || !navigator.onLine) && e('div', {
+      style: {
+        position: 'absolute', top: 12, left: 12, right: 12, zIndex: 1000,
+        background: 'var(--bg-card)', border: '1px solid var(--border)', borderRadius: 10, padding: '8px 10px',
+        fontSize: 11, color: 'var(--text-secondary)', textAlign: 'center'
+      }
+    }, !navigator.onLine ? 'Offline mode: map tiles may be unavailable' : 'Limited mode: map tiles unavailable'),
 
     // Blip detail modal
     selectedBlipData && e(BlipDetailModal, {
@@ -1798,6 +3400,11 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       onClose: () => setSelectedBlip(null),
       onUpdate: handleUpdateBlip,
       onDelete: handleDeleteBlip,
+      onRoute: (blip) => {
+        setRouteTarget({ lat: blip.lat, lng: blip.lng, label: blip.title });
+        setRouteActive(false);
+      },
+      logActivity,
       profile,
       sendToAllPeers,
       sendToPeer,
@@ -1834,12 +3441,17 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
           e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 } }, 'Blips'),
           visibleBlips.length === 0
             ? e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', padding: '8px 0' } }, 'No visible blips.')
-            : visibleBlips.slice(0, 8).map(b => e('button', {
+            : visibleBlips.slice(0, blipListLimit).map(b => e('button', {
                 key: b.id,
                 onClick: () => { setRouteTarget({ lat: b.lat, lng: b.lng, label: b.title }); setShowWaypoint(false); },
                 className: 'boost-btn',
                 style: { width: '100%', textAlign: 'left', background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 10, padding: '8px 10px', marginBottom: 6, color: 'var(--text-primary)', cursor: 'pointer' }
               }, b.title)),
+          visibleBlips.length > blipListLimit && e('button', {
+            onClick: () => setBlipListLimit(prev => prev + 8),
+            className: 'boost-btn',
+            style: { width: '100%', textAlign: 'center', background: 'var(--bg-deep)', border: '1px dashed var(--border)', borderRadius: 10, padding: '8px 10px', color: 'var(--text-secondary)', cursor: 'pointer' }
+          }, 'Show More Blips'),
         ),
         e('div', null,
           e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6 } }, 'Custom'),
@@ -1861,7 +3473,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         borderRadius: '50%', background: 'var(--bg-card)', border: '1px solid var(--border)', color: 'var(--accent)',
         fontSize: 18, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
       }
-    }, '◎'),
+    }, '⌖'),
 
     // Blip count badge
     e('div', {
@@ -1882,6 +3494,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
       e('div', null,
         e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginBottom: 2 } }, 'Route to ' + (routeTarget.label || 'Waypoint')),
         routeLoading && e('div', { style: { fontSize: 10, color: 'var(--text-secondary)', marginBottom: 4 } }, 'Calculating route...'),
+        routeError && e('div', { style: { fontSize: 10, color: 'var(--amber)', marginBottom: 4 } }, 'Using estimate (routing unavailable)'),
         e('div', { style: { fontSize: 13, color: 'var(--text-primary)', fontWeight: 600 } }, 'Shortest: ' + distanceStr(routeDistances.direct)),
         e('div', { style: { fontSize: 11, color: 'var(--text-secondary)' } }, 'Alternative: ' + (routeDistances.alt !== null ? distanceStr(routeDistances.alt) : '--')),
       ),
@@ -1988,7 +3601,7 @@ function MapView({ position, blips, setBlips, profile, sendToAllPeers, sendToPee
         e('div', { style: { display: 'flex', gap: 16, marginBottom: 16 } },
           e('label', { style: { display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text-secondary)', cursor: 'pointer' } },
             e('input', { type: 'checkbox', checked: newBlip.shareWithPeers, onChange: (ev) => setNewBlip(prev => ({ ...prev, shareWithPeers: ev.target.checked })) }),
-            '📡 Share with peers'
+            '🔗 Share with peers'
           ),
         ),
 
@@ -2014,13 +3627,13 @@ function GeochatView({ position, geochatMessages, setGeochatMessages, profile, s
   const [mood, setMood] = useState('');
   const feedEndRef = useRef(null);
 
-  const moods = ['😌 Calm', '😊 Happy', '😂 Funny', '🔥 Hype', '⚠️ Alert', '👀 Curious', '🎯 Focused', '💬 Social'];
+  const moods = ['🧘 Calm', '😊 Happy', '😂 Funny', '🔥 Hype', '🚨 Alert', '🤔 Curious', '🎯 Focused', '🫶 Social'];
 
   const zoneRadius = settings.geochat.zoneRadius || 1000;
   const zoneName = position ? getZoneName(position.lat, position.lng, zoneRadius) : 'Unknown Zone';
   const zoneKey = position ? getZoneKey(position.lat, position.lng, zoneRadius) : '';
 
-  // FIXED: More permissive filtering — show messages from same zone OR within radius
+  // FIXED: More permissive filtering - show messages from same zone OR within radius
   const filteredMessages = geochatMessages.filter(m => {
     // Always show own messages
     if (m.sender === (settings.geochat.anonymous ? 'Anon' : profile.displayName) || m.senderId === profile.peerId) return true;
@@ -2155,11 +3768,38 @@ function GeochatView({ position, geochatMessages, setGeochatMessages, profile, s
 
 // ========================== SETTINGS VIEW ==========================
 
-function SettingsView({ profile, setProfile, settings, setSettings, initPeer, blips, setBlips, setMessages, setGeochatMessages, setPeers, categories }) {
+function SettingsView({ profile, setProfile, settings, setSettings, initPeer, blips, setBlips, messages, setMessages, geochatMessages, setGeochatMessages, posts, setPosts, geoPosts, setGeoPosts, activity, setActivity, hiddenPosts, setHiddenPosts, peers, setPeers, categories, runDailyBackup }) {
   const [section, setSection] = useState(null);
   const [showQR, setShowQR] = useState(false);
   const [newBlipType, setNewBlipType] = useState({ label: '', icon: '', color: 'var(--accent)' });
   const customBlipTypes = settings.customBlipTypes || [];
+  const colorOptions = [
+    { label: 'None (Use Theme Accent)', value: '' },
+    { label: 'Neon Green', value: '#39FF14' },
+    { label: 'Ocean Blue', value: '#4A90FF' },
+    { label: 'Cyan', value: '#00F0FF' },
+    { label: 'Amber', value: '#FFB800' },
+    { label: 'Magenta', value: '#FF2D78' },
+    { label: 'Purple', value: '#A855F7' },
+    { label: 'Orange', value: '#FF6B35' },
+    { label: 'Ruby Red', value: '#FF0000' },
+    { label: 'Slate', value: '#94A3B8' },
+  ];
+  const themeOptions = [
+    { id: 'onyx', label: 'Onyx', swatches: ['#05070c', '#101622', '#78c5ff'] },
+    { id: 'paper', label: 'Paper', swatches: ['#f7f8fb', '#ffffff', '#2a5bd7'] },
+    { id: 'dusk', label: 'Dusk', swatches: ['#1b1428', '#2a2140', '#b58cff'] },
+    { id: 'neon', label: 'Neon', swatches: ['#070a12', '#182236', '#00f0ff'] },
+    { id: 'pastel', label: 'Pastel', swatches: ['#f7f3f6', '#ffffff', '#7b9cff'] },
+    { id: 'sunset', label: 'Sunset', swatches: ['#1b1216', '#2d2224', '#ff8a3d'] },
+    { id: 'ocean', label: 'Ocean', swatches: ['#0c1b22', '#1a2f39', '#2dd4bf'] },
+    { id: 'rose', label: 'Rose', swatches: ['#1b1218', '#2b2029', '#ff7a9e'] },
+    { id: 'matcha', label: 'Matcha', swatches: ['#17221b', '#223028', '#7bd389'] },
+    { id: 'lavender', label: 'Lavender', swatches: ['#1b162a', '#2b2341', '#c2a0ff'] },
+    { id: 'desert', label: 'Desert', swatches: ['#f6efe5', '#fff7ee', '#c16a2f'] },
+    { id: 'ivory', label: 'Ivory', swatches: ['#f7f6f2', '#ffffff', '#1e4bd6'] },
+    { id: 'mono', label: 'Mono', swatches: ['#0d0f12', '#1f242c', '#cfd5dd'] },
+  ];
 
   function updateSettings(path, value) {
     setSettings(prev => {
@@ -2187,6 +3827,216 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
     }
   }
 
+  function importBackupData(imported) {
+    if (!imported || typeof imported !== 'object') throw new Error('Invalid');
+    if (imported.profile) {
+      setProfile(p => ({
+        ...p,
+        displayName: imported.profile.displayName || p.displayName,
+        avatar: imported.profile.avatar || p.avatar,
+        createdAt: imported.profile.createdAt || p.createdAt,
+      }));
+    }
+    if (imported.settings) {
+      setSettings(prev => ({
+        ...prev,
+        ...imported.settings,
+        peerServer: { ...DEFAULT_SETTINGS.peerServer, ...(imported.settings.peerServer || {}) },
+        iceServers: { ...DEFAULT_SETTINGS.iceServers, ...(imported.settings.iceServers || {}) },
+        geochat: { ...DEFAULT_SETTINGS.geochat, ...(imported.settings.geochat || {}) },
+        map: { ...DEFAULT_SETTINGS.map, ...(imported.settings.map || {}) },
+        ui: { ...DEFAULT_SETTINGS.ui, ...(imported.settings.ui || {}) },
+        push: { ...DEFAULT_SETTINGS.push, ...(imported.settings.push || {}) },
+        backup: { ...DEFAULT_SETTINGS.backup, ...(imported.settings.backup || {}) },
+        customBlipTypes: imported.settings.customBlipTypes || prev.customBlipTypes || [],
+      }));
+    }
+    if (Array.isArray(imported.peers)) {
+      setPeers(prev => {
+        const map = new Map(prev.map(p => [p.peerId, p]));
+        imported.peers.forEach(p => {
+          if (!p || !p.peerId) return;
+          map.set(p.peerId, { ...(map.get(p.peerId) || {}), ...p });
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (Array.isArray(imported.blips)) {
+      setBlips(prev => {
+        const map = new Map(prev.map(b => [b.id, b]));
+        imported.blips.forEach(b => {
+          if (!b || !b.id) return;
+          map.set(b.id, map.get(b.id) || b);
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (imported.messages && typeof imported.messages === 'object') {
+      setMessages(prev => {
+        const next = { ...prev };
+        Object.keys(imported.messages).forEach(pid => {
+          const prevMsgs = next[pid] || [];
+          const incoming = imported.messages[pid] || [];
+          const seen = new Set(prevMsgs.map(m => m.id));
+          const merged = [...prevMsgs];
+          incoming.forEach(m => {
+            if (!m || !m.id) return;
+            if (!seen.has(m.id)) {
+              seen.add(m.id);
+              merged.push(m);
+            }
+          });
+          next[pid] = merged;
+        });
+        return next;
+      });
+    }
+    if (Array.isArray(imported.geochatMessages)) {
+      setGeochatMessages(prev => {
+        const map = new Map(prev.map(m => [m.id, m]));
+        imported.geochatMessages.forEach(m => {
+          if (!m || !m.id) return;
+          map.set(m.id, map.get(m.id) || m);
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (Array.isArray(imported.posts)) {
+      setPosts(prev => {
+        const map = new Map(prev.map(p => [p.id, p]));
+        imported.posts.forEach(p => {
+          if (!p || !p.id) return;
+          map.set(p.id, map.get(p.id) || p);
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (Array.isArray(imported.geoPosts)) {
+      setGeoPosts(prev => {
+        const map = new Map(prev.map(p => [p.id, p]));
+        imported.geoPosts.forEach(p => {
+          if (!p || !p.id) return;
+          map.set(p.id, map.get(p.id) || p);
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (Array.isArray(imported.activity)) {
+      setActivity(prev => {
+        const map = new Map(prev.map(a => [a.id, a]));
+        imported.activity.forEach(a => {
+          if (!a || !a.id) return;
+          map.set(a.id, map.get(a.id) || a);
+        });
+        return Array.from(map.values());
+      });
+    }
+    if (Array.isArray(imported.hiddenPosts)) {
+      setHiddenPosts(imported.hiddenPosts);
+    }
+  }
+
+  const mutedPeers = (peers || []).filter(p => p.muted);
+
+  async function chooseBackupFolder() {
+    if (!window.showDirectoryPicker) {
+      showToast('Folder access not supported', 'var(--magenta)');
+      return;
+    }
+    try {
+      const handle = await window.showDirectoryPicker();
+      await idbSet('backupDir', handle);
+      showToast('Backup folder set', 'var(--neon-green)');
+    } catch {}
+  }
+
+  async function restoreFromFolder() {
+    if (!window.showDirectoryPicker) {
+      const fallback = readBackupFallback();
+      if (!fallback) return showToast('No in-app backup found', 'var(--magenta)');
+      try {
+        importBackupData(fallback);
+        showToast('Backup restored', 'var(--neon-green)');
+      } catch {
+        showToast('Invalid in-app backup', 'var(--magenta)');
+      }
+      return;
+    }
+    const root = await getBackupDirHandle();
+    if (!root) {
+      showToast('Backup folder not set', 'var(--amber)');
+      return;
+    }
+    try {
+      const subdir = await root.getDirectoryHandle('boost', { create: false });
+      const name = settings.backup && settings.backup.name ? settings.backup.name : (profile.displayName || profile.peerId || 'user');
+      const safeName = sanitizeFilename(name);
+      const fileHandle = await subdir.getFileHandle(`boost-backup(${safeName}).json`);
+      const file = await fileHandle.getFile();
+      const text = await file.text();
+      const imported = JSON.parse(text);
+      importBackupData(imported);
+      showToast('Backup restored', 'var(--neon-green)');
+    } catch {
+      showToast('Backup not found in folder', 'var(--magenta)');
+    }
+  }
+
+  async function registerPush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      showToast('Push not supported on this device', 'var(--magenta)');
+      return;
+    }
+    if (!settings.push.serverUrl || !settings.push.vapidPublicKey) {
+      showToast('Add server URL + VAPID key first', 'var(--amber)');
+      return;
+    }
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      showToast('Notification permission denied', 'var(--magenta)');
+      return;
+    }
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(settings.push.vapidPublicKey),
+      });
+      const serverUrl = settings.push.serverUrl.replace(/\/$/, '');
+      await fetch(serverUrl + '/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ peerId: profile.peerId, subscription: sub }),
+      });
+      showToast('Push enabled', 'var(--neon-green)');
+    } catch {
+      showToast('Push registration failed', 'var(--magenta)');
+    }
+  }
+
+  async function unregisterPush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      showToast('Push not supported on this device', 'var(--magenta)');
+      return;
+    }
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) await sub.unsubscribe();
+      if (settings.push.serverUrl) {
+        const serverUrl = settings.push.serverUrl.replace(/\/$/, '');
+        await fetch(serverUrl + '/unsubscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ peerId: profile.peerId }),
+        });
+      }
+      showToast('Push disabled', 'var(--amber)');
+    } catch {
+      showToast('Push unregister failed', 'var(--magenta)');
+    }
+  }
+
   const sectionStyle = { background: 'var(--bg-card)', borderRadius: 12, padding: '16px', marginBottom: 12, border: '1px solid var(--border)' };
   const labelStyle = { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 6, fontWeight: 500, textTransform: 'uppercase', letterSpacing: 1 };
   const inputStyle = { width: '100%', background: 'var(--bg-deep)', border: '1px solid var(--border)', borderRadius: 8, padding: '10px 12px', color: 'var(--text-primary)', fontSize: 13, marginBottom: 10 };
@@ -2204,7 +4054,7 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         ),
       ),
       e('div', { style: { display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 12 } },
-        ['⚡', '🔥', '💀', '👾', '🎮', '🌙', '🚀', '💎', '🎯', '🐉', '🦊', '🤖'].map(av => e('button', {
+        ['⚡', '🔥', '💀', '👾', '🎮', '🌙', '🚀', '💎', '🎯', '🐉', '🦊', '🤖', '😎', '😊', '🧠', '🦉', '🐯', '🐼', '🦈', '🦁', '🦄'].map(av => e('button', {
           key: av, onClick: () => setProfile(p => ({ ...p, avatar: av })),
           style: { fontSize: 22, padding: '4px 8px', background: profile.avatar === av ? 'var(--bg-card2)' : 'transparent', border: profile.avatar === av ? '1px solid var(--accent)' : '1px solid transparent', borderRadius: 8, cursor: 'pointer' }
         }, av))
@@ -2214,9 +4064,9 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         e('div', { style: { ...labelStyle, marginBottom: 8 } }, 'SHARE YOUR ID'),
         !showQR
           ? e('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
-              e('button', { onClick: () => setShowQR(true), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: '#A855F7', fontSize: 12, cursor: 'pointer' } }, '📱 Show QR'),
+              e('button', { onClick: () => setShowQR(true), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: '#A855F7', fontSize: 12, cursor: 'pointer' } }, '📷 Show QR'),
               e('button', { onClick: () => handleShareVia('copy'), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: 'var(--accent)', fontSize: 12, cursor: 'pointer' } }, '📋 Copy ID'),
-              navigator.share && e('button', { onClick: () => handleShareVia('native'), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer' } }, '📤 Share'),
+              navigator.share && e('button', { onClick: () => handleShareVia('native'), className: 'boost-btn', style: { background: 'var(--bg-card2)', border: '1px solid var(--border)', borderRadius: 8, padding: '8px 14px', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer' } }, '🔗 Share'),
             )
           : e('div', { style: { textAlign: 'center' } },
               e('div', { style: { background: '#fff', borderRadius: 12, padding: 12, display: 'inline-block', marginBottom: 8 } },
@@ -2231,20 +4081,30 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
     // Appearance
     e('div', { style: sectionStyle },
       e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, 'Appearance'),
-      e('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 } },
-        ['obsidian', 'slate', 'ivory', 'carbon', 'aurora', 'sand'].map(theme => e('button', {
-          key: theme,
-          onClick: () => updateSettings('ui.theme', theme),
+      e('div', { style: { display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 6 } },
+        themeOptions.map(t => e('button', {
+          key: t.id,
+          onClick: () => updateSettings('ui.theme', t.id),
           className: 'boost-btn',
           style: {
-            padding: '10px', borderRadius: 10,
-            background: (settings.ui && settings.ui.theme) === theme ? 'var(--bg-card2)' : 'var(--bg-deep)',
-            border: '1px solid ' + ((settings.ui && settings.ui.theme) === theme ? 'var(--accent)' : 'var(--border)'),
-            color: (settings.ui && settings.ui.theme) === theme ? 'var(--accent)' : 'var(--text-secondary)',
-            fontSize: 12, fontWeight: 600, cursor: 'pointer', textTransform: 'capitalize'
+            minWidth: 92, padding: '8px 10px', borderRadius: 999,
+            background: (settings.ui && settings.ui.theme) === t.id ? 'var(--bg-card2)' : 'var(--bg-deep)',
+            border: '1px solid ' + ((settings.ui && settings.ui.theme) === t.id ? 'var(--accent)' : 'var(--border)'),
+            color: (settings.ui && settings.ui.theme) === t.id ? 'var(--accent)' : 'var(--text-secondary)',
+            fontSize: 11, fontWeight: 600, cursor: 'pointer', textTransform: 'capitalize', whiteSpace: 'nowrap',
+            display: 'flex', alignItems: 'center', gap: 8, justifyContent: 'space-between', overflow: 'hidden'
           }
-        }, theme))
+        },
+          e('span', null, t.label),
+          e('span', { style: { display: 'flex', gap: 4, flexShrink: 0 } },
+            t.swatches.map((c, i) => e('span', {
+              key: i,
+              style: { width: 10, height: 10, borderRadius: '50%', background: c, border: '1px solid rgba(0,0,0,0.15)' }
+            }))
+          )
+        ))
       ),
+      e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'Swipe to see more themes'),
     ),
 
     // Custom Blip Types
@@ -2284,12 +4144,13 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         }),
       ),
       e('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 } },
-        e('input', {
-          value: newBlipType.color,
+        e('select', {
+          value: newBlipType.color || '',
           onChange: (ev) => setNewBlipType(prev => ({ ...prev, color: ev.target.value })),
-          placeholder: 'var(--accent)',
           style: { ...inputStyle, marginBottom: 0 }
-        }),
+        },
+          colorOptions.map(opt => e('option', { key: opt.label, value: opt.value }, opt.label))
+        ),
         e('button', {
           onClick: () => {
             const label = newBlipType.label.trim();
@@ -2310,7 +4171,7 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
 
     // PeerJS Server
     e('div', { style: sectionStyle },
-      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, '🌐 PeerJS Server'),
+      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, '🛰️ PeerJS Server'),
       e('div', { style: toggleRowStyle },
         e('span', { style: { fontSize: 13, color: 'var(--text-primary)' } }, 'Use Default Cloud'),
         e('input', {
@@ -2342,7 +4203,46 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
         onClick: () => { initPeer(); showToast('Reconnecting...', 'var(--amber)'); },
         className: 'boost-btn',
         style: { width: '100%', padding: '10px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontWeight: 600, fontSize: 13, cursor: 'pointer', marginTop: 8 }
-      }, '🔄 Reconnect'),
+      }, '⚡ Reconnect'),
+    ),
+
+    // Push Notifications
+    e('div', { style: sectionStyle },
+      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, 'Push Notifications'),
+      e('div', { style: toggleRowStyle },
+        e('span', { style: { fontSize: 13, color: 'var(--text-primary)' } }, 'Enable Push for Buzz'),
+        e('input', {
+          type: 'checkbox', checked: !!(settings.push && settings.push.enabled),
+          onChange: (ev) => updateSettings('push.enabled', ev.target.checked),
+        }),
+      ),
+      e('div', { style: labelStyle }, 'RELAY SERVER URL'),
+      e('input', {
+        value: (settings.push && settings.push.serverUrl) || '',
+        onChange: (ev) => updateSettings('push.serverUrl', ev.target.value),
+        placeholder: 'https://your-relay.example.com',
+        style: inputStyle,
+      }),
+      e('div', { style: labelStyle }, 'VAPID PUBLIC KEY'),
+      e('input', {
+        value: (settings.push && settings.push.vapidPublicKey) || '',
+        onChange: (ev) => updateSettings('push.vapidPublicKey', ev.target.value),
+        placeholder: 'BOPd...your key...',
+        style: inputStyle,
+      }),
+      e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+        e('button', {
+          onClick: registerPush,
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Register Device'),
+        e('button', {
+          onClick: unregisterPush,
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--amber)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Unregister'),
+      ),
+      e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'Optional relay for buzz when peers are offline.'),
     ),
 
     // ICE Servers
@@ -2437,6 +4337,60 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
       e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
         e('button', {
           onClick: () => {
+            const data = JSON.stringify({
+              version: 1,
+              profile: { displayName: profile.displayName, avatar: profile.avatar, createdAt: profile.createdAt },
+              settings,
+              peers,
+              messages,
+              blips,
+              geochatMessages,
+              posts,
+              geoPosts,
+              activity,
+              hiddenPosts,
+            }, null, 2);
+            const blob = new Blob([data], { type: 'application/json' });
+            if (navigator.msSaveOrOpenBlob) {
+              navigator.msSaveOrOpenBlob(blob, 'boost-backup.json');
+              showToast('Backup exported', 'var(--neon-green)');
+              return;
+            }
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'boost-backup.json';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+            showToast('Backup exported', 'var(--neon-green)');
+          },
+          className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Export All'),
+        e('button', {
+          onClick: () => {
+            const input = document.createElement('input');
+            input.type = 'file'; input.accept = '.json';
+            input.onchange = (ev) => {
+              const file = ev.target.files[0];
+              if (!file) return;
+              const reader = new FileReader();
+              reader.onload = (e) => {
+                try {
+                  const imported = JSON.parse(e.target.result);
+                  if (!confirm('Import backup and merge data?')) return;
+                  importBackupData(imported);
+                  showToast('Backup imported', 'var(--neon-green)');
+                } catch { showToast('Invalid backup file', 'var(--magenta)'); }
+              };
+              reader.readAsText(file);
+            };
+            input.click();
+          },
+          className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--amber)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Import All'),
+        e('button', {
+          onClick: () => {
             const data = JSON.stringify(blips, null, 2);
             const blob = new Blob([data], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
@@ -2445,7 +4399,7 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
             showToast('Blips exported!', 'var(--neon-green)');
           },
           className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
-        }, '📤 Export Blips'),
+        }, '⬇️ Export Blips'),
         e('button', {
           onClick: () => {
             const input = document.createElement('input');
@@ -2468,7 +4422,23 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
             input.click();
           },
           className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--amber)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
-        }, '📥 Import Blips'),
+        }, '⬆️ Import Blips'),
+        e('button', {
+          onClick: () => {
+            if (!confirm('Clean up mixed posts and fix feed separation?')) return;
+            setPosts(prev => prev.map(p => ({ ...p, feed: p.feed || 'peers' })).filter(p => p.feed !== 'geofeed'));
+            setGeoPosts(prev => prev.map(p => ({ ...p, feed: p.feed || 'geofeed' })).filter(p => p.feed === 'geofeed'));
+            showToast('Posts cleaned', 'var(--neon-green)');
+          },
+          className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
+        }, 'Clean Mixed Posts'),
+        e('button', {
+          onClick: () => {
+            setHiddenPosts([]);
+            showToast('Hidden posts cleared', 'var(--neon-green)');
+          },
+          className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--text-secondary)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
+        }, 'Clear Hidden Posts'),
         e('button', {
           onClick: () => {
             if (confirm('Clear ALL data? This cannot be undone.')) {
@@ -2477,14 +4447,88 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
             }
           },
           className: 'boost-btn', style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--magenta)', color: 'var(--magenta)', fontSize: 12, cursor: 'pointer', fontWeight: 500 }
-        }, '🗑️ Clear All Data'),
+        }, '🧹 Clear All Data'),
       ),
+    ),
+
+    // Muted peers
+    e('div', { style: sectionStyle },
+      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, 'Muted Peers'),
+      mutedPeers.length === 0 && e('div', { style: { fontSize: 12, color: 'var(--text-secondary)' } }, 'No muted peers.'),
+      mutedPeers.map(p => e('div', {
+        key: p.peerId,
+        style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, padding: '8px 10px', background: 'var(--bg-deep)', border: '1px solid var(--border)', borderRadius: 10, marginBottom: 6 }
+      },
+        e('div', { style: { fontSize: 12, color: 'var(--text-primary)' } }, p.displayName || p.peerId),
+        e('button', {
+          onClick: () => setPeers(prev => prev.map(x => x.peerId === p.peerId ? { ...x, muted: false } : x)),
+          className: 'boost-btn',
+          style: { padding: '6px 10px', borderRadius: 8, background: 'transparent', border: '1px solid var(--border)', color: 'var(--text-secondary)', fontSize: 11, cursor: 'pointer' }
+        }, 'Unmute')
+      ))
+    ),
+
+    // Backups
+    e('div', { style: sectionStyle },
+      e('div', { style: { ...labelStyle, fontSize: 14, marginBottom: 12 } }, 'Backups'),
+      e('div', { style: toggleRowStyle },
+        e('span', { style: { fontSize: 13, color: 'var(--text-primary)' } }, 'Daily Backup'),
+        e('input', {
+          type: 'checkbox',
+          checked: !!(settings.backup && settings.backup.enabled),
+          onChange: (ev) => updateSettings('backup.enabled', ev.target.checked),
+        }),
+      ),
+      e('div', { style: labelStyle }, 'BACKUP NAME'),
+      e('input', {
+        value: (settings.backup && settings.backup.name) || '',
+        onChange: (ev) => updateSettings('backup.name', ev.target.value),
+        placeholder: profile.displayName || profile.peerId || 'user',
+        style: inputStyle,
+      }),
+      e('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+        e('button', {
+          onClick: chooseBackupFolder,
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Choose Folder'),
+        e('button', {
+          onClick: () => runDailyBackup(true, true),
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--neon-green)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Backup Now'),
+        e('button', {
+          onClick: restoreFromFolder,
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--amber)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, window.showDirectoryPicker ? 'Restore From Folder' : 'Restore In-App Backup'),
+        e('button', {
+          onClick: () => {
+            const fallback = readBackupFallback();
+            if (!fallback) return showToast('No in-app backup found', 'var(--magenta)');
+            const data = JSON.stringify(fallback, null, 2);
+            const blob = new Blob([data], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'boost-backup.json';
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+            showToast('Backup exported', 'var(--neon-green)');
+          },
+          className: 'boost-btn',
+          style: { padding: '10px 14px', borderRadius: 8, background: 'var(--bg-card2)', border: '1px solid var(--border)', color: 'var(--accent)', fontSize: 12, cursor: 'pointer', fontWeight: 600 }
+        }, 'Export In-App Backup'),
+      ),
+      !window.showDirectoryPicker && e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'This browser cannot save to folders. Backups are stored in-app and will be removed if you clear site data.'),
+      window.showDirectoryPicker && e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginTop: 6 } }, 'Saves to: selected folder / boost / boost-backup(name).json'),
     ),
 
     // About
     e('div', { style: { ...sectionStyle, textAlign: 'center' } },
       e('div', { style: { fontSize: 24, fontWeight: 700, color: 'var(--accent)', letterSpacing: 4, marginBottom: 4 } }, '⚡ BOOST'),
-      e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 } }, 'v1.1.0 — P2P Social Map & Chat'),
+      e('div', { style: { fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8 } }, 'v1.1.0 - P2P Social Map & Chat'),
       e('div', { style: { fontSize: 11, color: 'var(--text-secondary)', marginBottom: 4 } }, 'Built with PeerJS, Leaflet, React'),
       e('a', { href: 'https://fractal.co.ke', style: { fontSize: 12, color: 'var(--accent)', textDecoration: 'none' } }, 'Powered by Fractal'),
     ),
@@ -2499,6 +4543,22 @@ function SettingsView({ profile, setProfile, settings, setSettings, initPeer, bl
 
 const root = ReactDOM.createRoot(document.getElementById('root'));
 root.render(e(App));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
